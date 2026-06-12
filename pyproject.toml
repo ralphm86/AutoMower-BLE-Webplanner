@@ -24,6 +24,9 @@ dependencies = [
 [tool.ruff]
 required-version = ">=0.4.2"
 
+[tool.setuptools]
+packages = ["automower_ble"]
+
 [tool.setuptools.package-data]
 automower_ble = ["*.json"]
 

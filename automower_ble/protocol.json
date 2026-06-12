@@ -175,8 +175,7 @@
             "useOnThursday": "bool",
             "useOnFriday": "bool",
             "useOnSaturday": "bool",
-            "useOnSunday": "bool",
-            "unknown": "uint16"
+            "useOnSunday": "bool"
         },
         "description": "Get a specified task"
     },
@@ -185,16 +184,14 @@
         "minor": 7,
         "requestType": {
             "start": "uint32",
-            "duration": "uint16",
-            "useOnSunday": "bool",
-            "unknown_1": "uint8",
+            "duration": "uint32",
             "useOnMonday": "bool",
             "useOnTuesday": "bool",
             "useOnWednesday": "bool",
             "useOnThursday": "bool",
             "useOnFriday": "bool",
             "useOnSaturday": "bool",
-            "unknown_2": "uint8"
+            "useOnSunday": "bool"
         },
         "description": "Add a new task during a task transaction"
     },

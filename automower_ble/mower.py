@@ -66,6 +66,20 @@ class Mower(BLEClient):
                 logger.warning("Failed to send keep alive: %s", e)
             await asyncio.sleep(15)
 
+    async def set_time(self) -> None:
+        """Synchronise the mower's internal clock to the current local time.
+
+        The protocol uses a non-standard "local Unix timestamp": seconds elapsed
+        since 1970-01-01 00:00:00 in local wall-clock time (DST-aware).
+        calendar.timegm() reinterprets the local timetuple as if it were UTC,
+        producing the correct value without any timezone offset being applied.
+        """
+        import calendar as _calendar
+        local_unix = int(_calendar.timegm(dt.datetime.now().timetuple()))
+        await self.command("SetTime", time=local_unix)
+        logger.info("Mower clock synchronised: local_unix=%d (%s)",
+                    local_unix, dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
     async def command(self, command_name: str, **kwargs):
         """
         This function is used to simplify the communication of the mower using the commands found in protocol.json.
@@ -174,6 +188,49 @@ class Mower(BLEClient):
 
         # Request trigger to start, the response validation is expected to fail
         await self.command("StartTrigger")
+
+    async def mower_park_home(self):
+        """
+        Park the mower until further notice (HOME mode).
+        The mower goes home and parks forever - week schedule is not used and
+        cannot be overridden with forced mowing.
+        """
+        await self.command("SetMode", mode=ModeOfOperation.HOME)
+
+    async def get_all_tasks(self) -> list[TaskInformation]:
+        """Get all scheduled tasks from the mower"""
+        num = await self.command("GetNumberOfTasks")
+        if num is None:
+            return []
+        tasks = []
+        for i in range(num):
+            task = await self.get_task(i)
+            if task is not None:
+                tasks.append(task)
+        return tasks
+
+    async def set_schedule(self, tasks: list[TaskInformation]) -> None:
+        """
+        Replace the full mowing schedule with the given list of tasks.
+        Uses a task transaction: StartTaskTransaction → DeleteAllTask →
+        AddTask × N → CommitTaskTransaction.
+        """
+        await self.command("StartTaskTransaction")
+        await self.command("DeleteAllTask")
+        for task in tasks:
+            await self.command(
+                "AddTask",
+                start=task.next_start_time,
+                duration=task.duration_in_seconds,
+                useOnMonday=int(bool(task.on_monday)),
+                useOnTuesday=int(bool(task.on_tuesday)),
+                useOnWednesday=int(bool(task.on_wednesday)),
+                useOnThursday=int(bool(task.on_thursday)),
+                useOnFriday=int(bool(task.on_friday)),
+                useOnSaturday=int(bool(task.on_saturday)),
+                useOnSunday=int(bool(task.on_sunday)),
+            )
+        await self.command("CommitTaskTransaction")
 
     async def get_task(self, taskid: int) -> TaskInformation | None:
         """

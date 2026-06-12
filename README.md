@@ -1,101 +1,237 @@
 # AutoMower-BLE
 
-This is an unofficial reverse engineered Husqvarna Automower Connect BLE library. This allows connecting and controlling an Automower without any accounts, cloud or network connection.
+An unofficial, reverse-engineered Husqvarna Automower BLE library with a full-featured local web interface. Control your mower, manage its schedule, and let a weather-aware planning agent keep the lawn cut — all without any cloud account or internet dependency (except optional weather data).
 
 <noscript><a href="https://liberapay.com/alistair23/donate"><img alt="Donate using Liberapay" src="https://liberapay.com/assets/widgets/donate.svg"></a></noscript>
 
-This library is written with the intent of integrating into Home Assistant, but it can be used independently as well.
+Developed and tested against an **Automower 305**. Should work on all Automowers; reports for other models are welcome.
 
-Details on how this was developed are available at: https://www.alistair23.me/2024/01/06/reverse-engineering-automower-ble
+Details on the reverse-engineering process: https://www.alistair23.me/2024/01/06/reverse-engineering-automower-ble
 
-This was developed and tested against a Automower 305, but it should work on all Automowers. If you are able to test on different models please do and report any results back.
+---
+
+## System Overview
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                  AutoMower-BLE Stack                    │
+│                                                         │
+│  Browser  ──HTTP──►  web_app.py  (FastAPI / uvicorn)   │
+│                           │                             │
+│                    ┌──────┴──────┐                      │
+│                    │             │                      │
+│               planner.py    automower_ble/              │
+│           (Weather Agent)    mower.py                   │
+│                    │         protocol.py                │
+│                    │         protocol.json              │
+│             Open-Meteo API       │                      │
+│             (forecast +          │                      │
+│              current wx)    BLE (bleak)                 │
+│                                  │                      │
+│                           Husqvarna Automower           │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Components
+
+| File / Package | Role |
+|---|---|
+| `automower_ble/protocol.json` | Reverse-engineered BLE command definitions (major/minor IDs, request & response field types) |
+| `automower_ble/protocol.py` | Low-level BLE client: packet encoding/decoding, CRC, connection handshake |
+| `automower_ble/mower.py` | High-level mower API: `connect`, `set_schedule`, `mower_park`, `set_time`, etc. |
+| `web_app.py` | FastAPI web server — REST API + HTML page serving. Manages connection state, auto-reconnect, time sync |
+| `planner.py` | Weather-based planning agent (`PlannerAgent`) and real-time watchdog (`WeatherWatchdog`) |
+| `templates/index.html` | Single-page Bootstrap 5 UI (7 tabs: Connect, Status, Commands, Schedule, Statistics, Messages, Planner) |
+| `planner_config.json` | Persisted planner settings (location, windows, thresholds, watchdog) |
+| `reconnect_config.json` | Persisted BLE address, channel ID, PIN, and auto-reconnect flag |
+
+### Key Features
+
+- **BLE pairing & control** — scan, connect, pair (with optional PIN), send all standard commands
+- **Schedule editor** — read the current 7-day schedule, edit it visually, push it back to the mower
+- **Auto-reconnect** — background loop re-connects automatically after a dropout
+- **Clock sync** — mower clock synced to local time on every connect
+- **Weather planner** — fetches hourly forecasts from [Open-Meteo](https://open-meteo.com) (free, no API key), computes optimal mowing slots respecting rain, wind, temperature, and rain-delay constraints, pushes the schedule to the mower
+- **Weather watchdog** — polls *current* conditions every N minutes; parks the mower (HOME mode) if a thunderstorm or threshold breach is detected mid-session, resumes automatically when conditions clear
+- **Flash wear protection** — schedule is only written to the mower when it actually changes
+
+---
 
 ## Installation
-This library can be installed by 
-```shell
-pip3 install automower-ble
-```
-Please note that the library is under active development and that the code on github might not be released for pip.
 
-## Testing Connections
+### Requirements
 
-You can test querying data with the following
+- Python **3.12** or newer
+- Bluetooth adapter (built-in on Raspberry Pi)
+- Linux (BlueZ stack); macOS works for development
 
-```shell
-python3 ./mower.py --address D8:B6:73:40:07:37
-```
+### Quick Start (local machine)
 
-You can uncomment parts of `async def main(mower)` to send commands, or send commands using parameters:
+```bash
+git clone https://github.com/your-repo/AutoMower-BLE.git
+cd AutoMower-BLE
 
-```shell
-python3 ./mower.py --address D8:B6:73:40:07:37 --command park
-```
+python3.12 -m venv .venv
+source .venv/bin/activate
 
-Where command is one of:
-  park
-  pause
-  override
-  resume
+pip install --upgrade pip
+pip install bleak bleak_retry_connector fastapi uvicorn jinja2 python-multipart
+pip install -e .
 
-(override will run for 3hrs)
-
-To get the address, the `ble_scanner.py` script can be run.
-
-## Unit testing for developers
-
-Unit tests are found in the /tests/ folder.
-
-You can run the unit tests with [pytest](https://docs.pytest.org). Install it by `pip3 install pytest`. In the root path, just run
-
-```shell
-pytest
+python web_app.py --host 127.0.0.1 --port 8080
 ```
 
-## PIN codes with Flymo or similar
+Open **http://127.0.0.1:8080** in your browser.
 
-Some models (Easilife Go and other brands that use Husqvarna internal boards) don't have an option to disable PIN.
-They accept the pin by pressing the sequence of buttons on the mower and on the app when setting up the pairing.
-The PIN sequence is translated to digits like this:
+### Raspberry Pi Zero 2W (headless server)
 
-On/OFF Power button = 1
+```bash
+# 1. System packages
+sudo apt update
+sudo apt install -y python3.12 python3.12-venv bluetooth bluez libglib2.0-dev
 
-Go/Schedule button = 2
+# 2. Enable Bluetooth
+sudo systemctl enable bluetooth
+sudo systemctl start bluetooth
 
-Go button = 3
+# 3. Deploy project
+cd /home/pi
+git clone https://github.com/your-repo/AutoMower-BLE.git   # or scp from your dev machine
+cd AutoMower-BLE
 
-Park button = 4
+# 4. Virtual environment
+python3.12 -m venv .venv
+source .venv/bin/activate
 
-See below image from operators manual. Which indicates the default pin would be 1234
+# 5. Dependencies
+pip install --upgrade pip
+pip install bleak bleak_retry_connector fastapi uvicorn jinja2 python-multipart
+pip install -e .
 
-![image](https://github.com/user-attachments/assets/10c75863-a634-4686-bc4c-15bb128dcad9)
+# 6. First run (test)
+python web_app.py --host 0.0.0.0 --port 8080
+```
 
-This is specific to Flymo units, so PIN mapping may be different.
+The web UI is reachable at **http://\<pi-ip\>:8080** from any device on your network.
 
-## Debugging logs on an Android phone
+#### Run on boot (systemd)
 
-You can get Bluetooth debug logs from an Android phone which will help development for new features, unknown codes
-or implementation of extra devices. To debug you need to enable developer mode on your
-Android handset/tablet (and have the manufacturer app installed to communicate with your mower)
+```bash
+sudo nano /etc/systemd/system/automower.service
+```
 
-To enable debug mode on Android:
+```ini
+[Unit]
+Description=AutoMower BLE Web Interface
+After=bluetooth.target network.target
 
-* Go into settings and System (Sometimes this is in About phone). Look for the "Build number" entry.
-* Tap this several times, onscreen you should then see a note confirming by tapping 7 times developer mode will be enabled.
-* Once enabled, click BACK and you'll see a "Developer Options" menu. In there scroll to find "Enable Bluetooth HCI snoop log".
-* Set "Enable Bluetooth HCI snoop log" to "Enabled"
-* Turn bluetooth OFF then back ON to enable the logging.
+[Service]
+User=pi
+WorkingDirectory=/home/pi/AutoMower-BLE
+ExecStart=/home/pi/AutoMower-BLE/.venv/bin/python web_app.py --host 0.0.0.0 --port 8080
+Restart=on-failure
+RestartSec=5
 
-Go into your mower app and carry out the commands, making a note of precise time you send the command to the mower.
-Once you've captured the commands, to retrieve the log you can either grab it using your phones file browser.
-The file location is /data/misc/bluetooth/logs
-The filename is btsnoop_hci.log
-(This varies, for example Samsung phones store them elsewhere)
+[Install]
+WantedBy=multi-user.target
+```
 
-An alternative is to use the adb via usb to retrieve the log. Plug your phone in via usb and use adb to download your
-bug report:
-  adb bugreport MyFilename
-(This will generate a bugreport and save it as MyFilename.zip)
-Extract that zip file and the bluetooth HCI snoop file is in FS/data/log/bt/btsnoop_hci.log
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable automower
+sudo systemctl start automower
 
-These bluetooth hci snoop files (btsnoop_hci.log) are in wireshark file format so use wireshark to view them.
-You can then see the commands sent and received from your mower and can then decode/investigate the commands.
+# Check status / logs
+sudo systemctl status automower
+sudo journalctl -u automower -f
+```
+
+---
+
+## Configuration Files
+
+Both files are created automatically on first use and are reloaded at runtime without restart.
+
+**`reconnect_config.json`** — BLE connection target:
+```json
+{
+  "target": { "address": "D8:B6:73:40:07:37", "channel_id": 1197489078, "pin": null },
+  "enabled": true
+}
+```
+
+**`planner_config.json`** — Planner & watchdog settings (edit via the Planner tab in the UI).
+
+---
+
+## CLI / Library Usage
+
+Scan for nearby Husqvarna devices:
+```bash
+python ble_scanner.py
+```
+
+Direct mower control (without the web app):
+```bash
+python automower_ble/mower.py --address D8:B6:73:40:07:37
+# with a command:
+python automower_ble/mower.py --address D8:B6:73:40:07:37 --command park
+```
+
+Available commands: `park`, `pause`, `override`, `resume`
+
+---
+
+## Developer Notes
+
+### Running Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+### Command Protocol
+
+Commands are defined in `automower_ble/protocol.json`. Each entry specifies:
+- `major` / `minor` — BLE command identifiers
+- `requestType` — ordered dict of field name → type (`uint8`, `uint16`, `uint32`, `bool`, `ascii`)
+- `responseType` — same structure for the response payload
+
+Fields are serialised **in the order they appear in the JSON** (little-endian). Adding new commands only requires a JSON entry; no Python changes needed unless the command has special logic.
+
+---
+
+## PIN Codes (Flymo / OEM models)
+
+Some models (Easilife Go and other Husqvarna OEM boards) require a PIN. The PIN is entered by pressing physical buttons on the mower during pairing:
+
+| Button | Digit |
+|---|---|
+| On/Off | 1 |
+| Go/Schedule | 2 |
+| Go | 3 |
+| Park | 4 |
+
+Default PIN is typically `1234`. See your operator's manual for the button layout.
+
+---
+
+## Capturing Bluetooth Traffic (Android)
+
+Useful for reverse-engineering new commands or debugging unknown responses.
+
+1. Enable **Developer Options** on your Android device (tap *Build number* 7 times in Settings → About)
+2. In Developer Options, enable **Bluetooth HCI snoop log**
+3. Toggle Bluetooth off and back on
+4. Use the manufacturer app to send commands to the mower
+5. Retrieve the log:
+   - File path: `/data/misc/bluetooth/logs/btsnoop_hci.log` (varies by manufacturer)
+   - Via ADB: `adb bugreport MyFilename` → extract zip → `FS/data/log/bt/btsnoop_hci.log`
+6. Open in Wireshark with the bundled `husqvarna_automower_protocol.lua` plugin:
+
+```bash
+mkdir -p ~/.config/wireshark/plugins
+cp husqvarna_automower_protocol.lua ~/.config/wireshark/plugins/
+```
+
+Filter for outgoing requests: `btatt.opcode == 0x52`

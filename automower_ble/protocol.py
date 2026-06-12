@@ -162,7 +162,7 @@ class Command:
                 elif request_type == "uint16":
                     request_length += 2
                     request_data += kwargs[request_name].to_bytes(2, byteorder="little")
-                elif request_type == "uint8":
+                elif request_type in ("uint8", "bool"):
                     request_length += 1
                     request_data += kwargs[request_name].to_bytes(1, byteorder="little")
                 else:
@@ -215,7 +215,7 @@ class Command:
                 dpos += len(data)
             else:
                 raise ValueError("Unknown data type: " + dtype)
-        if dpos != len(data):
+        if dpos > len(data):
             raise ValueError(f"Data length mismatch. Read {dpos} bytes of {len(data)}")
         return response
 
