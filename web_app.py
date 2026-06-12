@@ -584,6 +584,7 @@ class PlannerConfigRequest(BaseModel):
     rain_delay_minutes: int = 0
     watchdog_enabled: bool = False
     watchdog_interval_minutes: int = 5
+    hedgehog_protection: bool = False
 
 
 @app.get("/api/planner/config")
@@ -642,8 +643,8 @@ async def get_planner_status():
 
 @app.get("/api/planner/forecast")
 async def get_planner_forecast():
-    """Return the last fetched weather forecast (as returned by the planner)."""
-    return {"forecast": planner.last_forecast}
+    """Return the last fetched weather forecast and daily sunrise/sunset data."""
+    return {"forecast": planner.last_forecast, "daily": planner.last_daily}
 
 
 @app.get("/api/planner/geocode")

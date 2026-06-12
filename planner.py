@@ -58,6 +58,8 @@ DEFAULT_CONFIG: dict = {
     # Weather watchdog: monitors current conditions while the mower is active
     "watchdog_enabled": False,
     "watchdog_interval_minutes": 5,
+    # Hedgehog protection: restrict mowing to daylight hours (sunrise–sunset)
+    "hedgehog_protection": False,
     # Runtime state (persisted for display only)
     "last_plan_time": None,
     "last_plan_result": "Never run",
@@ -107,6 +109,7 @@ def _fetch_openmeteo_sync(lat: float, lon: float) -> dict:
         "latitude": lat,
         "longitude": lon,
         "hourly": "temperature_2m,precipitation,windspeed_10m,weathercode",
+        "daily": "sunrise,sunset",
         "wind_speed_unit": "ms",
         "timezone": "auto",
         "forecast_days": 7,
@@ -124,6 +127,41 @@ def _fetch_openmeteo_sync(lat: float, lon: float) -> dict:
 async def fetch_forecast(lat: float, lon: float) -> dict:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _fetch_openmeteo_sync, lat, lon)
+
+
+def parse_daily(data: dict) -> dict[str, dict]:
+    """
+    Parse Open-Meteo daily data into {date_str: {"sunrise": datetime, "sunset": datetime}}.
+    Times are returned in the local timezone indicated by utc_offset_seconds.
+    """
+    daily = data.get("daily", {})
+    times    = daily.get("time", [])
+    sunrises = daily.get("sunrise", [])
+    sunsets  = daily.get("sunset", [])
+    utc_offset_sec = data.get("utc_offset_seconds", 0)
+    tz = dt.timezone(dt.timedelta(seconds=utc_offset_sec))
+    result: dict[str, dict] = {}
+    for i, d in enumerate(times):
+        sr_str = sunrises[i] if i < len(sunrises) else None
+        ss_str = sunsets[i]  if i < len(sunsets)  else None
+        try:
+            sr = dt.datetime.fromisoformat(sr_str).replace(tzinfo=tz) if sr_str else None
+            ss = dt.datetime.fromisoformat(ss_str).replace(tzinfo=tz) if ss_str else None
+        except Exception:
+            sr = ss = None
+        result[d] = {"sunrise": sr, "sunset": ss}
+    return result
+
+
+def daily_to_serialisable(daily: dict[str, dict]) -> dict[str, dict]:
+    """Convert {date: {sunrise/sunset: datetime}} to JSON-serialisable form."""
+    return {
+        d: {
+            "sunrise": v["sunrise"].isoformat() if v.get("sunrise") else None,
+            "sunset":  v["sunset"].isoformat()  if v.get("sunset")  else None,
+        }
+        for d, v in daily.items()
+    }
 
 
 def _geocode_openmeteo_sync(city: str) -> list[dict]:
@@ -360,6 +398,7 @@ def _find_best_subwindow(
 def plan_schedule(
     config: dict,
     forecast_periods: list[dict],
+    daily: Optional[dict] = None,
 ) -> tuple[list[TaskInformation], list[dict]]:
     """
     Build a mowing schedule for the next 7 days.
@@ -448,9 +487,41 @@ def plan_schedule(
                 )
                 continue
 
+            # Hedgehog protection: trim window to daylight hours
+            if config.get("hedgehog_protection") and daily:
+                day_info = daily.get(date.isoformat(), {})
+                sr = day_info.get("sunrise")
+                ss = day_info.get("sunset")
+                if sr and ss:
+                    sr_sec = sr.hour * 3600 + sr.minute * 60
+                    ss_sec = ss.hour * 3600 + ss.minute * 60
+                    eff_start_sec = max(w_start_h * 3600, sr_sec)
+                    eff_end_sec   = min(w_end_h * 3600, ss_sec)
+                    if eff_end_sec - eff_start_sec < min_dur_sec:
+                        fail_status = "hedgehog"
+                        fail_reason = (
+                            f"Hedgehog protection: window outside daylight "
+                            f"({sr.strftime('%H:%M')}↑ – {ss.strftime('%H:%M')}↓)"
+                        )
+                        continue
+                    # w_start_h: floor so the sunrise slot is included;
+                    #   earliest_start_sec = eff_start_sec pins the actual
+                    #   mowing start to the exact sunrise minute.
+                    # w_end_h: ceiling so the sunset boundary slot is included;
+                    #   the session is clipped to the exact sunset second below.
+                    w_start_h = eff_start_sec // 3600
+                    w_end_h   = min(
+                        (eff_end_sec + 3599) // 3600,  # ceiling division
+                        int(win["end_hour"]),           # never exceed configured window
+                    )
+                    search_start_sec = eff_start_sec
+                else:
+                    search_start_sec = w_start_h * 3600
+            else:
+                search_start_sec = w_start_h * 3600
+
             # Keep finding sub-windows within this window until target is met
             # (mower firmware allows at most 2 tasks per day across all windows)
-            search_start_sec = w_start_h * 3600
             while (remaining_sec >= min_dur_sec
                    and search_start_sec < w_end_h * 3600
                    and len(day_sessions) < 2):
@@ -465,6 +536,20 @@ def plan_schedule(
                     fail_status = "weather"
                     fail_reason = reason
                     break
+                # Hedgehog: clip session to end at or before the exact sunset second
+                if config.get("hedgehog_protection") and daily:
+                    day_info = daily.get(date.isoformat(), {})
+                    ss_dt = day_info.get("sunset")
+                    if ss_dt:
+                        sunset_sec = ss_dt.hour * 3600 + ss_dt.minute * 60
+                        sess_s = min(sess_s, max(0, sunset_sec - start_s))
+                        if sess_s < min_dur_sec:
+                            fail_status = "hedgehog"
+                            fail_reason = (
+                                f"Hedgehog protection: remaining daylight too short "
+                                f"({ss_dt.strftime('%H:%M')}\u2193)"
+                            )
+                            break
                 day_sessions.append((start_s, sess_s, reason))
                 remaining_sec -= sess_s
                 search_start_sec = start_s + sess_s  # next search starts after this session
@@ -538,6 +623,7 @@ class PlannerAgent:
         self.last_run: Optional[str] = None
         self.last_result: str = "Never run"
         self.last_forecast: list[dict] = []
+        self.last_daily: dict = {}
         self._last_pushed_fp: Optional[list[tuple]] = None  # None = not yet verified against mower
 
     def set_mower_provider(self, provider: Callable) -> None:
@@ -580,9 +666,16 @@ class PlannerAgent:
             return self._set_result(f"Weather fetch failed: {e}")
 
         periods = parse_forecast(data)
+        daily   = parse_daily(data)
+        # Annotate each hourly period with an is_daylight flag for the UI
+        for p in periods:
+            day_info = daily.get(p["dt"].strftime("%Y-%m-%d"), {})
+            sr, ss = day_info.get("sunrise"), day_info.get("sunset")
+            p["is_daylight"] = (sr <= p["dt"] < ss) if (sr and ss) else True
         self.last_forecast = forecast_to_serialisable(periods)
+        self.last_daily    = daily_to_serialisable(daily)
 
-        tasks, log = plan_schedule(config, periods)
+        tasks, log = plan_schedule(config, periods, daily=daily)
         self.last_log = log
 
         msg = f"Planned {len(tasks)} mowing session(s)"

@@ -453,6 +453,14 @@
               <div class="form-text">Wait this long after a rainy slot before starting the mower (0 = no delay).</div>
             </div>
 
+            <div class="form-check form-switch mb-2 mt-3">
+              <input id="pl-hedgehog" type="checkbox" class="form-check-input" role="switch" />
+              <label class="form-check-label fw-semibold" for="pl-hedgehog">
+                🦔 Hedgehog Protection
+              </label>
+              <div class="text-muted small">Restricts mowing to daylight hours only (sunrise–sunset), calculated from your configured location. Hedgehogs are most active at dusk and dawn.</div>
+            </div>
+
             <hr>
             <div class="form-check form-switch mb-2">
               <input id="pl-watchdog" type="checkbox" class="form-check-input" role="switch" />
@@ -1112,6 +1120,7 @@ async function loadPlannerConfig() {
     document.getElementById('pl-wind').value = cfg.max_wind_speed_ms ?? 10;
     document.getElementById('pl-temp').value = cfg.min_temp_celsius ?? 5;
     document.getElementById('pl-rain-delay').value = cfg.rain_delay_minutes ?? 0;
+    document.getElementById('pl-hedgehog').checked = !!cfg.hedgehog_protection;
     document.getElementById('pl-watchdog').checked = !!cfg.watchdog_enabled;
     document.getElementById('pl-watchdog-interval').value = cfg.watchdog_interval_minutes ?? 5;
 
@@ -1251,6 +1260,7 @@ async function savePlannerConfig() {
     max_wind_speed_ms: parseFloat(document.getElementById('pl-wind').value) ?? 10,
     min_temp_celsius: parseFloat(document.getElementById('pl-temp').value) ?? 5,
     rain_delay_minutes: parseInt(document.getElementById('pl-rain-delay').value) || 0,
+    hedgehog_protection: document.getElementById('pl-hedgehog').checked,
     watchdog_enabled: document.getElementById('pl-watchdog').checked,
     watchdog_interval_minutes: parseInt(document.getElementById('pl-watchdog-interval').value) || 5,
     available_windows: windows,
@@ -1394,6 +1404,7 @@ function renderPlannerLog(logEntries) {
     no_window:    '<span class="badge bg-secondary">No Window</span>',
     past_window:  '<span class="badge bg-dark">Past Window</span>',
     short_window: '<span class="badge bg-secondary">Short Window</span>',
+    hedgehog:     '<span class="badge bg-success bg-opacity-25 text-dark border">\u{1F994} Hedgehog</span>',
     skip:         '<span class="badge bg-light text-dark border">Skip</span>',
   };
   tbody.innerHTML = logEntries.map(e => {
@@ -1428,6 +1439,7 @@ async function loadPlannerForecast() {
     const minTemp      = cfg.min_temp_celsius  ?? 5.0;
     const rainDelayH   = (cfg.rain_delay_minutes ?? 0) / 60;
     const windows      = cfg.available_windows ?? [];
+    const daily        = fdata.daily || {};   // {date: {sunrise, sunset}}
 
     // Convert JS getDay() (0=Sun) → planner DOW (0=Mon)
     const plannerDow = dateStr => (new Date(dateStr).getDay() + 6) % 7;
@@ -1435,6 +1447,11 @@ async function loadPlannerForecast() {
       const dow = plannerDow(dateStr);
       return windows.some(w => parseInt(w.day) === dow && hour >= w.start_hour && hour < w.end_hour);
     };
+
+    // Format an ISO datetime string as HH:MM in local time
+    const fmtTime = iso => iso
+      ? new Date(iso).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})
+      : null;
 
     // Group by date
     const byDate = {};
@@ -1461,8 +1478,15 @@ async function loadPlannerForecast() {
     html += '<thead class="table-light"><tr><th>Date</th><th>Time</th><th>Weather</th><th>🌡️ °C</th><th>💧 mm/h</th><th>💨 m/s</th></tr></thead><tbody>';
 
     Object.entries(byDate).forEach(([date, periods]) => {
-      // Build set of rain-delay-blocked hours for this day.
-      // For each hour with rain > threshold, block the next ceil(rainDelayH) hours.
+      // Sunrise / sunset for this day
+      const dayInfo = daily[date] || {};
+      const srStr   = fmtTime(dayInfo.sunrise);
+      const ssStr   = fmtTime(dayInfo.sunset);
+      const sunLine = srStr && ssStr
+        ? `<br><small class="text-muted fw-normal">🌅 ${srStr}&nbsp;&nbsp;🌇 ${ssStr}</small>`
+        : '';
+
+      // Build set of rain-delay-blocked hours for this day
       const delayBlockedHours = new Set();
       if (rainDelayH > 0) {
         const rainyHours = new Set(
@@ -1481,6 +1505,7 @@ async function loadPlannerForecast() {
         const hour    = parseInt(p.dt.substring(11, 13));
         const timeStr = p.dt.substring(11, 16);
         const inWin   = isInWindow(date, hour);
+        const isDay   = p.is_daylight !== false;  // true when field absent (old data)
         const rainBad = p.rain_mm > maxRain;
         const windBad = p.wind_ms > maxWind;
         const tempBad = p.temp_c  < minTemp;
@@ -1489,10 +1514,8 @@ async function loadPlannerForecast() {
 
         let rowClass = '', rowStyle = '';
         if (!inWin) {
-          // Outside mowing window — dim the row
           rowStyle = 'opacity:0.30;';
         } else if (delayBlocked) {
-          // Inside window but still in rain-delay period
           rowClass = 'table-secondary';
         } else if (weatherBad) {
           rowClass = 'table-danger';
@@ -1500,12 +1523,18 @@ async function loadPlannerForecast() {
           rowClass = 'table-warning';
         }
 
-        const emoji   = wmoIcons[parseInt(p.icon)] ?? '🌡️';
-        const dayName = i === 0 ? ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][new Date(date).getDay()] : null;
+        const emoji      = wmoIcons[parseInt(p.icon)] ?? '🌡️';
+        const nightIcon  = !isDay ? ' 🦔' : '';
+        const dayName    = i === 0
+          ? ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][new Date(date).getDay()]
+          : null;
+
         html += `<tr class="${rowClass}">
-          ${i === 0 ? `<td rowspan="${periods.length}" class="fw-semibold align-middle">${dayName}<br><span class="fw-normal text-muted small">${date}</span></td>` : ''}
+          ${i === 0
+            ? `<td rowspan="${periods.length}" class="fw-semibold align-middle">${dayName}<br><span class="fw-normal text-muted small">${date}</span>${sunLine}</td>`
+            : ''}
           <td style="${rowStyle}">${timeStr}</td>
-          <td style="${rowStyle}">${emoji} ${escHtml(p.description)}</td>
+          <td style="${rowStyle}">${emoji}${nightIcon} ${escHtml(p.description)}</td>
           <td style="${rowStyle}">${p.temp_c.toFixed(1)}</td>
           <td style="${rowStyle}">${p.rain_mm.toFixed(1)}</td>
           <td style="${rowStyle}">${p.wind_ms.toFixed(1)}</td>
@@ -1519,6 +1548,7 @@ async function loadPlannerForecast() {
       <span><span class="badge bg-warning text-dark me-1">&nbsp;</span>Near threshold</span>
       <span><span class="badge bg-secondary me-1">&nbsp;</span>Rain delay</span>
       <span style="opacity:0.4">▪</span> Outside mowing window (dimmed)
+      <span>🦔 Night (outside daylight)</span>
     </div>`;
     el.innerHTML = html;
   } catch {}
