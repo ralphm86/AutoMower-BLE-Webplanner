@@ -151,7 +151,11 @@ class Mower(BLEClient):
         next_start_time = await self.command("GetNextStartTime")
         if next_start_time is None or next_start_time == 0:
             return None
-        return dt.datetime.fromtimestamp(next_start_time, dt.UTC)
+        # Mower stores time as a local epoch (seconds since 1970-01-01 00:00:00
+        # local time, set via calendar.timegm).  utcfromtimestamp() recovers the
+        # correct local wall-clock time as a naive datetime without shifting by
+        # the UTC offset.
+        return dt.datetime.utcfromtimestamp(next_start_time)
 
     async def mower_activity(self) -> MowerActivity | None:
         """Query the mower activity"""
@@ -185,6 +189,13 @@ class Mower(BLEClient):
 
     async def mower_park(self):
         await self.command("SetOverrideParkUntilNextStart")
+
+        # Request trigger to start, the response validation is expected to fail
+        await self.command("StartTrigger")
+
+    async def mower_park_duration(self, duration_hours: float) -> None:
+        """Park the mower for a specific duration, then resume normal schedule."""
+        await self.command("SetOverridePark", duration=int(duration_hours * 3600))
 
         # Request trigger to start, the response validation is expected to fail
         await self.command("StartTrigger")
@@ -340,7 +351,7 @@ async def main(mower: Mower):
     print("Last message: ")
     print(
         "\t"
-        + dt.datetime.fromtimestamp(last_message["time"], dt.UTC).strftime(
+        + dt.datetime.utcfromtimestamp(last_message["time"]).strftime(
             "%Y-%m-%d %H:%M:%S"
         )
     )

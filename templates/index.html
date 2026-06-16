@@ -185,6 +185,18 @@
               <i class="bi bi-house-fill me-1"></i>Park Until Next Start
             </button>
 
+            <div>
+              <label class="form-label fw-semibold">Park for Duration</label>
+              <div class="input-group">
+                <input id="park-hours" type="number" class="form-control" value="1" min="0.25" max="24" step="0.25" />
+                <span class="input-group-text">hours</span>
+                <button class="btn btn-warning cmd-btn" onclick="sendCommand('park_duration')">
+                  <i class="bi bi-hourglass-split me-1"></i>Park for Duration
+                </button>
+              </div>
+              <div class="form-text">Parks the mower for the set time, then resumes the normal schedule automatically.</div>
+            </div>
+
             <button class="btn btn-danger cmd-btn"
                     onclick="confirmCmd('This will park the mower until you manually resume it (HOME mode). Continue?', 'park_home')">
               <i class="bi bi-house-lock-fill me-1"></i>Park Until Further Notice
@@ -276,6 +288,36 @@
     </div>
     <div id="stats-content">
       <p class="text-muted">Connect to a mower first, then click <strong>Refresh</strong>.</p>
+    </div>
+
+    <!-- ── Runtime Estimator ────────────────────────────────────────── -->
+    <hr class="my-4">
+    <h6 class="mb-3"><i class="bi bi-stopwatch me-2"></i>Runtime Estimator</h6>
+    <div class="card">
+      <div class="card-body">
+        <p class="text-muted small mb-3">
+          Estimates mowing vs charging breakdown for a planned session.
+          Accuracy improves as sample data accumulates (1 sample/min while connected).
+        </p>
+        <div class="row g-2 align-items-end mb-3">
+          <div class="col-auto">
+            <label class="form-label fw-semibold mb-1" for="est-duration">Session Duration</label>
+            <div class="input-group">
+              <input id="est-duration" type="number" class="form-control" value="3" min="0.5" max="24" step="0.5" style="max-width:90px">
+              <span class="input-group-text">h</span>
+            </div>
+          </div>
+          <div class="col-auto">
+            <button class="btn btn-outline-primary" onclick="loadRuntimeEstimate()">
+              <i class="bi bi-calculator me-1"></i>Estimate
+            </button>
+            <button class="btn btn-outline-secondary ms-1" onclick="clearRuntimeSamples()" title="Reset sample history">
+              <i class="bi bi-trash"></i>
+            </button>
+          </div>
+        </div>
+        <div id="estimate-content"></div>
+      </div>
     </div>
   </div>
 
@@ -882,6 +924,8 @@ async function sendCommand(cmd) {
   let body;
   if (cmd === 'mow') {
     body = { duration_hours: parseFloat(document.getElementById('mow-hours').value) || 3 };
+  } else if (cmd === 'park_duration') {
+    body = { duration_hours: parseFloat(document.getElementById('park-hours').value) || 1 };
   }
   try {
     showSpinner();
@@ -1031,15 +1075,41 @@ async function loadStats() {
     showSpinner();
     const s = await api('GET', '/api/statistics');
     hideSpinner();
+
+    // Blade wear colour
+    const bladeColor = s.blade_wear_pct >= 90 ? 'danger' : s.blade_wear_pct >= 70 ? 'warning' : 'secondary';
+
+    // Override banner (if active)
+    let overrideBanner = '';
+    if (s.override) {
+      const remaining = s.override.remaining_seconds != null
+        ? ` — ${Math.round(s.override.remaining_seconds / 60)} min remaining` : '';
+      overrideBanner = `<div class="alert alert-warning py-2 mb-3">
+        <i class="bi bi-arrow-repeat me-2"></i>
+        <strong>Active override:</strong> ${escHtml(s.override.action)}${escHtml(remaining)}
+      </div>`;
+    }
+
     el.innerHTML = `
-      <div class="row g-3">
+      ${overrideBanner}
+      <h6 class="text-muted mb-2">Lifetime Counters</h6>
+      <div class="row g-3 mb-3">
         ${statCard('bi-clock', 'Total Running', s.total_running_hours + ' h', 'success')}
         ${statCard('bi-scissors', 'Total Cutting', s.total_cutting_hours + ' h', 'success')}
         ${statCard('bi-lightning-charge', 'Total Charging', s.total_charging_hours + ' h', 'warning')}
         ${statCard('bi-search', 'Searching', s.total_searching_hours + ' h', 'info')}
         ${statCard('bi-exclamation-triangle', 'Collisions', s.number_of_collisions, 'danger')}
         ${statCard('bi-battery-charging', 'Charge Cycles', s.number_of_charging_cycles, 'primary')}
-        ${statCard('bi-tools', 'Blade Usage', s.cutting_blade_usage_hours + ' h', 'secondary')}
+        ${statCard('bi-tools', 'Blade Usage', s.cutting_blade_usage_hours + ' h', bladeColor)}
+      </div>
+      <h6 class="text-muted mb-2">Efficiency &amp; Health</h6>
+      <div class="row g-3 mb-3">
+        ${statCard('bi-pie-chart', 'Cutting Ratio', s.cutting_ratio_pct != null ? s.cutting_ratio_pct + ' %' : '—', 'success')}
+        ${statCard('bi-compass', 'Searching Ratio', s.searching_ratio_pct != null ? s.searching_ratio_pct + ' %' : '—', 'info')}
+        ${statCard('bi-battery-half', 'Avg Charge/Cycle', s.avg_charge_duration_hours != null ? s.avg_charge_duration_hours + ' h' : '—', 'warning')}
+        ${statCard('bi-activity', 'Collision Rate', s.collision_rate_per_100h != null ? s.collision_rate_per_100h + ' /100 h' : '—', 'danger')}
+        ${statCard('bi-tools', 'Blade Wear', s.blade_wear_pct + ' %', bladeColor)}
+        ${s.remaining_charging_time_min != null ? statCard('bi-plug', 'Remaining Charge', s.remaining_charging_time_min + ' min', 'warning') : ''}
       </div>`;
   } catch (e) {
     hideSpinner();
@@ -1058,6 +1128,105 @@ function statCard(icon, label, value, color) {
         </div>
       </div>
     </div>`;
+}
+
+// ─── Runtime Estimator ────────────────────────────────────────────────────────
+async function loadRuntimeEstimate() {
+  const el = document.getElementById('estimate-content');
+  const durationH = parseFloat(document.getElementById('est-duration').value) || 3.0;
+  el.innerHTML = '<div class="spinner-border spinner-border-sm text-primary"></div> Computing…';
+  try {
+    showSpinner();
+    const e = await api('GET', `/api/runtime_estimate?duration_hours=${durationH}`);
+    hideSpinner();
+
+    const srcBadge = e.data_source === 'samples'
+      ? `<span class="badge bg-success">samples (${e.sample_count})</span>`
+      : e.data_source === 'statistics'
+      ? `<span class="badge bg-secondary">statistics fallback (${e.sample_count} samples so far)</span>`
+      : `<span class="badge bg-warning text-dark">insufficient data (${e.sample_count} samples)</span>`;
+
+    // Current live status
+    let statusHtml = '';
+    if (e.current_status) {
+      const ph = e.current_status.phase;
+      if (ph === 'mowing') {
+        const t = e.current_status.min_until_charge;
+        statusHtml = `<div class="alert alert-success py-2 mb-3">
+          <i class="bi bi-scissors me-2"></i><strong>Currently mowing</strong>
+          ${t != null ? `— ~<strong>${t} min</strong> until next charge stop` : '— charge timing not yet estimated (more samples needed)'}
+        </div>`;
+      } else if (ph === 'charging') {
+        const t = e.current_status.min_until_resume;
+        statusHtml = `<div class="alert alert-warning py-2 mb-3">
+          <i class="bi bi-battery-charging me-2"></i><strong>Currently charging</strong>
+          ${t != null ? `— ~<strong>${t} min</strong> until mowing resumes` : '— resume time unknown'}
+        </div>`;
+      } else if (ph === 'going_home') {
+        statusHtml = `<div class="alert alert-info py-2 mb-3">
+          <i class="bi bi-house me-2"></i><strong>Returning to station</strong> — charge stop imminent
+        </div>`;
+      }
+    }
+
+    if (!e.projection) {
+      el.innerHTML = `${statusHtml}
+        <div class="alert alert-secondary mb-0">
+          <i class="bi bi-info-circle me-2"></i>
+          Not enough data yet to build a projection. Data source: ${srcBadge}
+        </div>`;
+      return;
+    }
+
+    const p = e.projection;
+    const c = e.cycle;
+    const mowPct  = Math.round(p.estimated_mowing_hours   / durationH * 100);
+    const chgPct  = Math.round(p.estimated_charging_hours / durationH * 100);
+    const otherPct = Math.max(0, 100 - mowPct - chgPct);
+
+    el.innerHTML = `
+      ${statusHtml}
+      <div class="mb-3">
+        <div class="d-flex justify-content-between mb-1 small">
+          <span><span class="badge bg-success">Mowing</span> ${p.estimated_mowing_hours} h (${mowPct}%)</span>
+          <span><span class="badge bg-warning text-dark">Charging</span> ${p.estimated_charging_hours} h (${chgPct}%)</span>
+          ${otherPct > 0 ? `<span><span class="badge bg-info text-dark">Other</span> ~${otherPct}%</span>` : ''}
+        </div>
+        <div class="progress" style="height:20px" title="${p.estimated_mowing_hours} h mowing / ${p.estimated_charging_hours} h charging">
+          <div class="progress-bar bg-success" style="width:${mowPct}%">${mowPct > 12 ? p.estimated_mowing_hours + ' h' : ''}</div>
+          <div class="progress-bar bg-warning" style="width:${chgPct}%">${chgPct > 12 ? p.estimated_charging_hours + ' h' : ''}</div>
+          ${otherPct > 0 ? `<div class="progress-bar bg-info" style="width:${otherPct}%"></div>` : ''}
+        </div>
+      </div>
+      <div class="row g-2 mb-3">
+        ${statCard('bi-battery-charging', 'Charge Stops', p.estimated_charge_stops, 'warning')}
+        ${statCard('bi-pie-chart', 'Mow Efficiency', c.mow_efficiency_pct + ' %', 'success')}
+        ${statCard('bi-clock-history', 'Avg Cycle', c.cycle_total_h + ' h', 'secondary')}
+      </div>
+      <div class="text-muted small">
+        Data source: ${srcBadge}
+        ${e.rates.discharge_rate_pct_per_h != null ? ` &middot; Discharge: ${e.rates.discharge_rate_pct_per_h} %/h` : ''}
+        ${e.rates.charge_rate_pct_per_h    != null ? ` &middot; Charge: ${e.rates.charge_rate_pct_per_h} %/h` : ''}
+        ${e.rates.return_threshold_pct     != null ? ` &middot; Return threshold: ~${e.rates.return_threshold_pct}%` : ''}
+      </div>`;
+  } catch (ex) {
+    hideSpinner();
+    el.innerHTML = `<div class="alert alert-danger">Failed: ${escHtml(ex.message)}</div>`;
+  }
+}
+
+async function clearRuntimeSamples() {
+  if (!confirm('Clear all runtime samples? This resets the estimator history.')) return;
+  try {
+    showSpinner();
+    await api('DELETE', '/api/runtime_samples');
+    hideSpinner();
+    document.getElementById('estimate-content').innerHTML =
+      '<p class="text-muted small mb-0">Samples cleared. New samples will accumulate automatically while connected.</p>';
+  } catch (ex) {
+    hideSpinner();
+    toast('Failed to clear samples: ' + ex.message, 'danger');
+  }
 }
 
 // ─── Messages ─────────────────────────────────────────────────────────────────

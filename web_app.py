@@ -31,6 +31,7 @@ from automower_ble.mower import Mower
 from automower_ble.protocol import (
     MowerState,
     MowerActivity,
+    OverrideAction,
     ResponseResult,
     TaskInformation,
 )
@@ -50,6 +51,7 @@ logger = logging.getLogger(__name__)
 # ─── Global connection state ──────────────────────────────────────────────────
 _mower: Optional[Mower] = None
 _connected: bool = False
+_connection_lock = asyncio.Lock()   # serialises connect / disconnect operations
 
 # ─── Auto-reconnect ───────────────────────────────────────────────────────────
 _RECONNECT_CONFIG_PATH = Path("reconnect_config.json")
@@ -57,6 +59,14 @@ _RECONNECT_CONFIG_PATH = Path("reconnect_config.json")
 _reconnect_cfg: Optional[dict] = None
 _reconnect_enabled: bool = False   # user-controlled toggle
 _reconnect_task: Optional[asyncio.Task] = None
+
+# ─── Runtime sampler ──────────────────────────────────────────────────────────
+_SAMPLES_PATH = Path("runtime_samples.json")
+_MAX_SAMPLES = 2000       # ≈ 33 h at 60 s intervals
+_SAMPLE_INTERVAL_S = 60
+
+_runtime_samples: list[dict] = []
+_sampler_task: Optional[asyncio.Task] = None
 
 
 def _load_reconnect_state() -> None:
@@ -76,6 +86,75 @@ def _save_reconnect_state() -> None:
     ))
 
 
+def _load_runtime_samples() -> None:
+    """Load persisted battery/activity samples from disk into memory."""
+    global _runtime_samples
+    if _SAMPLES_PATH.exists():
+        try:
+            data = json.loads(_SAMPLES_PATH.read_text())
+            _runtime_samples = data.get("samples", [])[-_MAX_SAMPLES:]
+            logger.info("Loaded %d runtime samples from %s", len(_runtime_samples), _SAMPLES_PATH)
+        except Exception as exc:
+            logger.warning("Could not load runtime samples: %s", exc)
+
+
+def _save_runtime_samples() -> None:
+    """Persist runtime samples to disk atomically (compact JSON, no indent)."""
+    try:
+        _SAMPLES_PATH.write_text(
+            json.dumps({"samples": _runtime_samples[-_MAX_SAMPLES:]}, separators=(",", ":"))
+        )
+    except Exception as exc:
+        logger.warning("Failed to save runtime samples: %s", exc)
+
+
+async def _sampler_loop() -> None:
+    """Background task: record (timestamp, battery, activity, charging) every minute."""
+    global _runtime_samples
+    while True:
+        await asyncio.sleep(_SAMPLE_INTERVAL_S)
+        if not _connected or _mower is None:
+            continue
+        try:
+            battery, activity, charging = await asyncio.gather(
+                _mower.battery_level(),
+                _mower.mower_activity(),
+                _mower.is_charging(),
+            )
+            if battery is None or activity is None:
+                continue
+            _runtime_samples.append({
+                "ts": int(dt.datetime.now().timestamp()),
+                "battery": battery,
+                "activity": activity.value,
+                "charging": bool(charging),
+            })
+            if len(_runtime_samples) > _MAX_SAMPLES:
+                _runtime_samples = _runtime_samples[-_MAX_SAMPLES:]
+            _save_runtime_samples()
+            logger.debug("Sampler: battery=%d%% activity=%s", battery, activity.name)
+        except Exception as exc:
+            logger.debug("Sampler error (ignored): %s", exc)
+
+
+async def _cleanup_connection() -> None:
+    """Disconnect from the mower and clear global state.
+
+    Must be called instead of bare ``_mower = None`` assignments so the
+    underlying BleakClient (and its bleak-retry-connector auto-reconnect
+    machinery) is properly torn down and cannot leave a phantom BLE link at
+    the OS level while the web app believes it is disconnected.
+    """
+    global _mower, _connected
+    _connected = False
+    if _mower is not None:
+        m, _mower = _mower, None
+        try:
+            await m.disconnect()
+        except Exception as exc:
+            logger.warning("Mower cleanup error (ignored): %s", exc)
+
+
 async def _reconnect_loop() -> None:
     """Background loop: scan for saved mower and reconnect automatically."""
     global _mower, _connected
@@ -88,14 +167,19 @@ async def _reconnect_loop() -> None:
         if not _reconnect_enabled or not _reconnect_cfg:
             continue
 
-        # Sync stale flag: BLE dropped without going through /api/disconnect
+        # Sync stale flag: BLE dropped without going through /api/disconnect.
+        # Use _cleanup_connection() so the old BleakClient is properly torn
+        # down and bleak-retry-connector stops auto-reconnecting at the OS level.
         if _connected and (_mower is None or not _mower.is_connected()):
             logger.info("Auto-reconnect: detected unexpected disconnect")
-            _connected = False
-            _mower = None
+            await _cleanup_connection()
 
         if _connected:
             continue  # already connected
+
+        # Skip if /api/connect is already running a connect attempt.
+        if _connection_lock.locked():
+            continue
 
         try:
             addr = _reconnect_cfg["address"]
@@ -111,19 +195,32 @@ async def _reconnect_loop() -> None:
                 addr,
                 _reconnect_cfg.get("pin"),
             )
-            result = await candidate.connect(device)
-            if result == ResponseResult.OK:
-                _mower = candidate
-                _connected = True
-                logger.info("Auto-reconnect: connected to %s ✓", addr)
-                # Sync clock, then push pending schedule
-                try:
-                    await _mower.set_time()
-                except Exception as te:
-                    logger.warning("Auto-reconnect: time sync failed: %s", te)
-                asyncio.create_task(planner.run_once())
-            else:
-                logger.warning("Auto-reconnect: failed (%s)", result.name)
+            async with _connection_lock:
+                # Re-check: a concurrent /api/connect may have beaten us here.
+                if _connected:
+                    logger.debug("Auto-reconnect: concurrent connect won the race, aborting")
+                    try:
+                        await candidate.disconnect()
+                    except Exception:
+                        pass
+                    continue
+                result = await candidate.connect(device)
+                if result == ResponseResult.OK:
+                    _mower = candidate
+                    _connected = True
+                    logger.info("Auto-reconnect: connected to %s ✓", addr)
+                    # Sync clock, then push pending schedule
+                    try:
+                        await _mower.set_time()
+                    except Exception as te:
+                        logger.warning("Auto-reconnect: time sync failed: %s", te)
+                    asyncio.create_task(planner.run_once())
+                else:
+                    logger.warning("Auto-reconnect: failed (%s)", result.name)
+                    try:
+                        await candidate.disconnect()
+                    except Exception:
+                        pass
         except Exception as exc:
             logger.warning("Auto-reconnect error: %s", exc)
 
@@ -137,10 +234,12 @@ watchdog.set_mower_provider(lambda: _mower)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _reconnect_task
+    global _reconnect_task, _sampler_task
     # Startup
     _load_reconnect_state()
+    _load_runtime_samples()
     _reconnect_task = asyncio.create_task(_reconnect_loop())
+    _sampler_task = asyncio.create_task(_sampler_loop())
     cfg = planner_load_config()
     if cfg.get("enabled"):
         planner.start()
@@ -149,6 +248,8 @@ async def lifespan(app: FastAPI):
     # Shutdown
     if _reconnect_task:
         _reconnect_task.cancel()
+    if _sampler_task:
+        _sampler_task.cancel()
     await planner.stop()
     await watchdog.stop()
 
@@ -185,6 +286,10 @@ class ScheduleRequest(BaseModel):
 
 class MowRequest(BaseModel):
     duration_hours: float = 3.0
+
+
+class ParkDurationRequest(BaseModel):
+    duration_hours: float = 1.0
 
 
 # ─── HTML page ────────────────────────────────────────────────────────────────
@@ -226,33 +331,43 @@ async def connect_mower(req: ConnectRequest):
     if device is None:
         raise HTTPException(404, f"BLE device not found: {req.address}")
 
-    _mower = Mower(req.channel_id, req.address, req.pin)
-    result = await _mower.connect(device)
+    async with _connection_lock:
+        # Re-check inside lock: auto-reconnect may have connected while we scanned.
+        if _connected and _mower:
+            raise HTTPException(400, "Already connected — disconnect first.")
 
-    if result == ResponseResult.OK:
-        _connected = True
-        # Sync mower clock to local time immediately after pairing
+        candidate = Mower(req.channel_id, req.address, req.pin)
+        result = await candidate.connect(device)
+
+        if result == ResponseResult.OK:
+            _mower = candidate
+            _connected = True
+            # Sync mower clock to local time immediately after pairing
+            try:
+                await _mower.set_time()
+            except Exception as te:
+                logger.warning("Time sync after connect failed: %s", te)
+            # Persist target so auto-reconnect can find it after a dropout
+            _reconnect_cfg = {"address": req.address, "channel_id": req.channel_id, "pin": req.pin}
+            _reconnect_enabled = True
+            _save_reconnect_state()
+            return {"status": "connected", "address": req.address}
+
+        # Connect failed — disconnect the candidate to prevent an orphaned BLE link.
         try:
-            await _mower.set_time()
-        except Exception as te:
-            logger.warning("Time sync after connect failed: %s", te)
-        # Persist target so auto-reconnect can find it after a dropout
-        _reconnect_cfg = {"address": req.address, "channel_id": req.channel_id, "pin": req.pin}
-        _reconnect_enabled = True
-        _save_reconnect_state()
-        return {"status": "connected", "address": req.address}
-    elif result == ResponseResult.INVALID_PIN:
-        _mower = None
-        raise HTTPException(401, "Invalid PIN")
-    elif result == ResponseResult.NOT_ALLOWED:
-        _mower = None
-        raise HTTPException(
-            403,
-            "Connection not allowed — the mower may require a PIN or is locked.",
-        )
-    else:
-        _mower = None
-        raise HTTPException(500, f"Connection failed: {result.name}")
+            await candidate.disconnect()
+        except Exception:
+            pass
+
+        if result == ResponseResult.INVALID_PIN:
+            raise HTTPException(401, "Invalid PIN")
+        elif result == ResponseResult.NOT_ALLOWED:
+            raise HTTPException(
+                403,
+                "Connection not allowed — the mower may require a PIN or is locked.",
+            )
+        else:
+            raise HTTPException(500, f"Connection failed: {result.name}")
 
 
 @app.post("/api/disconnect")
@@ -295,10 +410,11 @@ async def toggle_auto_reconnect(enabled: bool):
 async def connection_status():
     """Return whether a mower is currently connected."""
     global _connected, _mower
-    # Sync stale flag (BLE dropped without explicit /api/disconnect)
+    # Sync stale flag (BLE dropped without explicit /api/disconnect).
+    # Properly tear down the old client so bleak-retry-connector does not keep
+    # the BLE link alive at the OS level while the app believes it's gone.
     if _connected and (_mower is None or not _mower.is_connected()):
-        _connected = False
-        _mower = None
+        await _cleanup_connection()
     return {
         "connected": _connected,
         "address": _mower.address if _connected and _mower else None,
@@ -350,22 +466,267 @@ async def get_status():
     }
 
 
+_BLADE_REPLACEMENT_INTERVAL_H = 200  # Husqvarna recommended blade interval (hours)
+
+
 @app.get("/api/statistics")
 async def get_statistics():
     """Return usage statistics from the mower."""
     _require_connection()
-    stats = await _mower.command("GetAllStatistics")
+
+    # Fetch core lifetime counters and supplementary live data in parallel.
+    stats, remaining_charge, override = await asyncio.gather(
+        _mower.command("GetAllStatistics"),
+        _mower.command("GetRemainingChargingTime"),
+        _mower.command("GetOverride"),
+    )
+
     if stats is None:
         raise HTTPException(500, "Failed to retrieve statistics from mower")
+
+    running_s: int = stats["totalRunningTime"]
+    cutting_s: int = stats["totalCuttingTime"]
+    charging_s: int = stats["totalChargingTime"]
+    searching_s: int = stats["totalSearchingTime"]
+    collisions: int = stats["numberOfCollisions"]
+    charge_cycles: int = stats["numberOfChargingCycles"]
+    blade_s: int = stats["cuttingBladeUsageTime"]
+
+    # ── Derived metrics ───────────────────────────────────────────────────────
+    cutting_ratio = round(cutting_s / running_s * 100, 1) if running_s else None
+    searching_ratio = round(searching_s / running_s * 100, 1) if running_s else None
+    avg_charge_h = round(charging_s / charge_cycles / 3600, 2) if charge_cycles else None
+    collision_rate = round(collisions / (running_s / 360000), 1) if running_s else None
+    blade_wear_pct = round(blade_s / (_BLADE_REPLACEMENT_INTERVAL_H * 3600) * 100, 1)
+
+    # ── Override status ───────────────────────────────────────────────────────
+    override_info = None
+    if override is not None:
+        action_val = override.get("action", 0)
+        try:
+            action_name = OverrideAction(action_val).name
+        except ValueError:
+            action_name = f"UNKNOWN_{action_val}"
+        if action_val != OverrideAction.NONE:
+            override_info = {
+                "action": action_name,
+                "remaining_seconds": override.get("duration"),
+            }
+
     return {
-        "total_running_hours": round(stats["totalRunningTime"] / 3600, 1),
-        "total_cutting_hours": round(stats["totalCuttingTime"] / 3600, 1),
-        "total_charging_hours": round(stats["totalChargingTime"] / 3600, 1),
-        "total_searching_hours": round(stats["totalSearchingTime"] / 3600, 1),
-        "number_of_collisions": stats["numberOfCollisions"],
-        "number_of_charging_cycles": stats["numberOfChargingCycles"],
-        "cutting_blade_usage_hours": round(stats["cuttingBladeUsageTime"] / 3600, 1),
+        # ── Lifetime counters ─────────────────────────────────────────────
+        "total_running_hours": round(running_s / 3600, 1),
+        "total_cutting_hours": round(cutting_s / 3600, 1),
+        "total_charging_hours": round(charging_s / 3600, 1),
+        "total_searching_hours": round(searching_s / 3600, 1),
+        "number_of_collisions": collisions,
+        "number_of_charging_cycles": charge_cycles,
+        "cutting_blade_usage_hours": round(blade_s / 3600, 1),
+        # ── Derived efficiency / health metrics ───────────────────────────
+        "cutting_ratio_pct": cutting_ratio,
+        "searching_ratio_pct": searching_ratio,
+        "avg_charge_duration_hours": avg_charge_h,
+        "collision_rate_per_100h": collision_rate,
+        "blade_wear_pct": blade_wear_pct,
+        # ── Live supplementary data ───────────────────────────────────────
+        "remaining_charging_time_min": (
+            round(remaining_charge / 60, 1) if remaining_charge else None
+        ),
+        "override": override_info,
     }
+
+
+# ─── Runtime estimation helpers ───────────────────────────────────────────────
+_MIN_SEG_SAMPLES = 3      # minimum samples to qualify a segment
+_MIN_SEG_MINUTES = 3.0    # minimum segment duration (minutes)
+
+
+def _analyse_samples(samples: list[dict]) -> dict:
+    """
+    Segment samples into completed mowing / charging runs and derive rates.
+    The last (possibly ongoing) segment is always skipped.
+    """
+    discharge_rates: list[float] = []
+    charge_rates: list[float] = []
+    return_thresholds: list[float] = []
+
+    if len(samples) < 2:
+        return {
+            "discharge_rate_pct_per_h": None,
+            "charge_rate_pct_per_h": None,
+            "return_threshold_pct": None,
+            "mow_segment_count": 0,
+            "charge_segment_count": 0,
+        }
+
+    # Build completed segments (skip last ongoing one)
+    segments: list[tuple[int, list[dict]]] = []
+    seg_start = 0
+    for i in range(1, len(samples)):
+        if samples[i]["activity"] != samples[seg_start]["activity"]:
+            segments.append((samples[seg_start]["activity"], samples[seg_start:i]))
+            seg_start = i
+    # samples[seg_start:] is the current segment — intentionally skipped
+
+    for idx, (act, seg) in enumerate(segments):
+        if len(seg) < _MIN_SEG_SAMPLES:
+            continue
+        duration_h = (seg[-1]["ts"] - seg[0]["ts"]) / 3600
+        if duration_h < _MIN_SEG_MINUTES / 60:
+            continue
+
+        if act == MowerActivity.MOWING.value:
+            drop = seg[0]["battery"] - seg[-1]["battery"]
+            if drop > 0:
+                discharge_rates.append(drop / duration_h)
+            # Capture the battery % at which the mower leaves for home
+            if idx + 1 < len(segments):
+                next_act = segments[idx + 1][0]
+                if next_act in (MowerActivity.GOING_HOME.value, MowerActivity.CHARGING.value):
+                    return_thresholds.append(float(seg[-1]["battery"]))
+
+        elif act == MowerActivity.CHARGING.value:
+            gain = seg[-1]["battery"] - seg[0]["battery"]
+            if gain > 0:
+                charge_rates.append(gain / duration_h)
+
+    return {
+        "discharge_rate_pct_per_h": round(sum(discharge_rates) / len(discharge_rates), 1) if discharge_rates else None,
+        "charge_rate_pct_per_h": round(sum(charge_rates) / len(charge_rates), 1) if charge_rates else None,
+        "return_threshold_pct": round(sum(return_thresholds) / len(return_thresholds), 1) if return_thresholds else None,
+        "mow_segment_count": len(discharge_rates),
+        "charge_segment_count": len(charge_rates),
+    }
+
+
+def _compute_runtime_estimate(
+    samples: list[dict],
+    stats: Optional[dict],
+    current_battery: Optional[int],
+    current_activity: Optional[MowerActivity],
+    remaining_charge_s: Optional[int],
+    duration_hours: float,
+) -> dict:
+    """
+    Estimate mowing vs charging breakdown for a session of *duration_hours*.
+
+    Priority:
+      1. Sample-derived rates (discharge/charge %/h + observed return threshold).
+      2. Lifetime statistics averages (totalCuttingTime / numberOfChargingCycles etc.).
+      3. Returns source="insufficient_data" with no projection when neither is available.
+    """
+    rates = _analyse_samples(samples)
+    discharge_rate = rates["discharge_rate_pct_per_h"]
+    charge_rate = rates["charge_rate_pct_per_h"]
+    threshold = rates["return_threshold_pct"]
+
+    mow_h: Optional[float] = None
+    charge_h: Optional[float] = None
+    other_h: float = 0.0
+    source = "insufficient_data"
+
+    if discharge_rate and charge_rate and threshold is not None:
+        usable_pct = 100.0 - threshold
+        mow_h = usable_pct / discharge_rate
+        charge_h = usable_pct / charge_rate
+        source = "samples"
+    elif stats and stats.get("numberOfChargingCycles", 0) > 0:
+        n = stats["numberOfChargingCycles"]
+        mow_h = stats["totalCuttingTime"] / n / 3600
+        charge_h = stats["totalChargingTime"] / n / 3600
+        other_h = stats["totalSearchingTime"] / n / 3600
+        source = "statistics"
+
+    # ── Current status ────────────────────────────────────────────────────────
+    act_val = current_activity.value if current_activity is not None else None
+    current_status: Optional[dict] = None
+
+    if act_val is not None and current_battery is not None:
+        if act_val == MowerActivity.MOWING.value:
+            if discharge_rate and threshold is not None:
+                secs = max(0.0, (current_battery - threshold) / discharge_rate * 3600)
+                current_status = {"phase": "mowing", "min_until_charge": round(secs / 60)}
+            else:
+                current_status = {"phase": "mowing", "min_until_charge": None}
+        elif act_val == MowerActivity.CHARGING.value:
+            current_status = {
+                "phase": "charging",
+                "min_until_resume": round(remaining_charge_s / 60) if remaining_charge_s else None,
+            }
+        elif act_val == MowerActivity.GOING_HOME.value:
+            current_status = {"phase": "going_home", "min_until_charge": 0}
+        else:
+            current_status = {"phase": current_activity.name.lower()}
+
+    if mow_h is None or charge_h is None:
+        return {
+            "sample_count": len(samples),
+            "data_source": source,
+            "rates": rates,
+            "current_status": current_status,
+            "projection": None,
+        }
+
+    # ── Projection ────────────────────────────────────────────────────────────
+    cycle_h = mow_h + charge_h + other_h
+    mow_efficiency_pct = round(mow_h / cycle_h * 100, 1)
+
+    full_cycles = int(duration_hours / cycle_h)
+    remainder_h = duration_hours - full_cycles * cycle_h
+    rem_mow_h = min(remainder_h, mow_h)
+    rem_charge_h = max(0.0, remainder_h - mow_h)
+
+    return {
+        "sample_count": len(samples),
+        "data_source": source,
+        "rates": rates,
+        "cycle": {
+            "avg_mow_h_per_cycle": round(mow_h, 2),
+            "avg_charge_h_per_cycle": round(charge_h, 2),
+            "cycle_total_h": round(cycle_h, 2),
+            "mow_efficiency_pct": mow_efficiency_pct,
+        },
+        "current_status": current_status,
+        "projection": {
+            "duration_hours": duration_hours,
+            "estimated_mowing_hours": round(full_cycles * mow_h + rem_mow_h, 2),
+            "estimated_charging_hours": round(full_cycles * charge_h + rem_charge_h, 2),
+            "estimated_charge_stops": full_cycles + (1 if rem_charge_h > 0.0 else 0),
+        },
+    }
+
+
+@app.get("/api/runtime_estimate")
+async def get_runtime_estimate(duration_hours: float = 3.0):
+    """Estimate mowing vs charging time for a planned mowing session."""
+    _require_connection()
+    if duration_hours <= 0:
+        raise HTTPException(422, "duration_hours must be > 0")
+
+    battery, activity, remaining_charge, stats = await asyncio.gather(
+        _mower.battery_level(),
+        _mower.mower_activity(),
+        _mower.command("GetRemainingChargingTime"),
+        _mower.command("GetAllStatistics"),
+    )
+
+    return _compute_runtime_estimate(
+        samples=_runtime_samples,
+        stats=stats,
+        current_battery=battery,
+        current_activity=activity,
+        remaining_charge_s=remaining_charge,
+        duration_hours=duration_hours,
+    )
+
+
+@app.delete("/api/runtime_samples")
+async def clear_runtime_samples():
+    """Clear all collected runtime samples, resetting the estimator history."""
+    global _runtime_samples
+    _runtime_samples = []
+    _save_runtime_samples()
+    return {"status": "ok", "sample_count": 0}
 
 
 # ─── Commands ─────────────────────────────────────────────────────────────────
@@ -412,6 +773,16 @@ async def command_park_home():
     _require_connection()
     await _mower.mower_park_home()
     return {"status": "ok", "action": "park_until_further_notice"}
+
+
+@app.post("/api/command/park_duration")
+async def command_park_duration(req: ParkDurationRequest):
+    """Park the mower for the specified duration (hours), then resume normal schedule."""
+    _require_connection()
+    if req.duration_hours <= 0:
+        raise HTTPException(422, "duration_hours must be > 0")
+    await _mower.mower_park_duration(req.duration_hours)
+    return {"status": "ok", "action": "park_duration", "duration_hours": req.duration_hours}
 
 
 # ─── Schedule ─────────────────────────────────────────────────────────────────
@@ -493,8 +864,8 @@ async def get_messages(count: int = 10):
             messages.append(
                 {
                     "message_id": i,
-                    "time": dt.datetime.fromtimestamp(
-                        msg["time"], dt.UTC
+                    "time": dt.datetime.utcfromtimestamp(
+                        msg["time"]
                     ).isoformat(),
                     "code": msg["code"],
                     "code_name": code_name,
