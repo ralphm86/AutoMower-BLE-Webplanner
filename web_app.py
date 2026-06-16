@@ -13,16 +13,20 @@ import argparse
 import asyncio
 import json
 import logging
+import os
+import secrets
 import datetime as dt
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+import bcrypt
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel
 
 from bleak import BleakScanner
@@ -47,6 +51,59 @@ from planner import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ─── Authentication ───────────────────────────────────────────────────────────
+_SESSION_COOKIE = "automower_session"
+_SESSION_MAX_AGE = 8 * 3600  # 8 hours
+_auth_hash: Optional[bytes] = None        # bcrypt hash; None = auth disabled
+_session_secret: str = secrets.token_hex(32)  # overridden by --secret-key
+
+# Simple in-memory rate-limiter for /login (per remote IP)
+_login_attempts: dict[str, list[float]] = {}
+_LOGIN_MAX_ATTEMPTS = 5
+_LOGIN_WINDOW_S = 300  # 5 minutes
+
+
+def _init_auth(password: Optional[str], secret: Optional[str]) -> None:
+    """Hash *password* and store it; optionally override the session secret."""
+    global _auth_hash, _session_secret
+    if password:
+        _auth_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+    if secret:
+        _session_secret = secret
+
+
+def _make_session_token() -> str:
+    s = URLSafeTimedSerializer(_session_secret, salt="automower-session")
+    return s.dumps("ok")
+
+
+def _verify_session_token(token: Optional[str]) -> bool:
+    if not token:
+        return False
+    try:
+        s = URLSafeTimedSerializer(_session_secret, salt="automower-session")
+        s.loads(token, max_age=_SESSION_MAX_AGE)
+        return True
+    except (BadSignature, SignatureExpired):
+        return False
+
+
+def _check_rate_limit(ip: str) -> bool:
+    """Return True when the IP is allowed to attempt another login."""
+    now = dt.datetime.now().timestamp()
+    recent = [t for t in _login_attempts.get(ip, []) if now - t < _LOGIN_WINDOW_S]
+    _login_attempts[ip] = recent
+    return len(recent) < _LOGIN_MAX_ATTEMPTS
+
+
+def _record_failed_attempt(ip: str) -> None:
+    now = dt.datetime.now().timestamp()
+    _login_attempts.setdefault(ip, []).append(now)
+
+
+# Initialise from environment variables so `uvicorn web_app:app` works too.
+_init_auth(os.environ.get("AUTH_PASSWORD"), os.environ.get("SECRET_KEY"))
 
 # ─── Global connection state ──────────────────────────────────────────────────
 _mower: Optional[Mower] = None
@@ -258,6 +315,23 @@ app = FastAPI(title="Automower BLE Control", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="."), name="static")
 templates = Jinja2Templates(directory="templates")
 
+
+@app.middleware("http")
+async def _auth_middleware(request: Request, call_next):
+    """Gate every route behind the session cookie when auth is enabled."""
+    if _auth_hash is None:
+        # Auth not configured — pass all requests through.
+        return await call_next(request)
+    path = request.url.path
+    # Public paths: login form + static assets
+    if path in ("/login", "/logout") or path.startswith("/static/"):
+        return await call_next(request)
+    if not _verify_session_token(request.cookies.get(_SESSION_COOKIE)):
+        if path.startswith("/api/"):
+            return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+        return RedirectResponse("/login", status_code=302)
+    return await call_next(request)
+
 HUSQVARNA_COMPANY_ID = 0x0426
 
 
@@ -296,6 +370,56 @@ class ParkDurationRequest(BaseModel):
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse(request, "index.html")
+
+
+# ─── Login / Logout ───────────────────────────────────────────────────────────
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request):
+    # Already authenticated → go straight to the app.
+    if _verify_session_token(request.cookies.get(_SESSION_COOKIE)):
+        return RedirectResponse("/", status_code=302)
+    return templates.TemplateResponse(request, "login.html", {"error": ""})
+
+
+@app.post("/login")
+async def login(
+    request: Request,
+    password: str = Form(...),
+):
+    client_ip = (request.client.host if request.client else None) or "unknown"
+    if not _check_rate_limit(client_ip):
+        logger.warning("Login rate-limit hit for %s", client_ip)
+        return templates.TemplateResponse(
+            request,
+            "login.html",
+            {"error": "Too many failed attempts — try again in 5 minutes."},
+            status_code=429,
+        )
+    if _auth_hash and bcrypt.checkpw(password.encode(), _auth_hash):
+        response = RedirectResponse("/", status_code=302)
+        response.set_cookie(
+            _SESSION_COOKIE,
+            _make_session_token(),
+            max_age=_SESSION_MAX_AGE,
+            httponly=True,
+            samesite="lax",
+        )
+        return response
+    _record_failed_attempt(client_ip)
+    logger.warning("Failed login attempt from %s", client_ip)
+    return templates.TemplateResponse(
+        request,
+        "login.html",
+        {"error": "Incorrect password."},
+        status_code=401,
+    )
+
+
+@app.post("/logout")
+async def logout():
+    response = RedirectResponse("/login", status_code=302)
+    response.delete_cookie(_SESSION_COOKIE)
+    return response
 
 
 # ─── BLE Scan ────────────────────────────────────────────────────────────────
@@ -1067,7 +1191,30 @@ if __name__ == "__main__":
         choices=["debug", "info", "warning", "error"],
         help="Logging level",
     )
+    parser.add_argument(
+        "--password",
+        default=None,
+        help="Web UI password (or set AUTH_PASSWORD env var). "
+             "If omitted, auth is disabled.",
+    )
+    parser.add_argument(
+        "--secret-key",
+        default=None,
+        help="Secret for signing session cookies (or set SECRET_KEY env var). "
+             "Defaults to a random value — sessions expire on restart.",
+    )
     args = parser.parse_args()
+
+    # CLI args take precedence over env vars (already applied at import time).
+    _init_auth(
+        args.password or os.environ.get("AUTH_PASSWORD"),
+        args.secret_key or os.environ.get("SECRET_KEY"),
+    )
+    if _auth_hash is None:
+        logging.warning(
+            "No --password set: web UI is unprotected. "
+            "Pass --password <pw> or set AUTH_PASSWORD to enable authentication."
+        )
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
