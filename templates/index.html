@@ -510,6 +510,68 @@
               <div class="text-muted small">Restricts mowing to daylight hours only (sunrise–sunset), calculated from your configured location. Hedgehogs are most active at dusk and dawn.</div>
             </div>
 
+            <div class="form-check form-switch mb-2 mt-3">
+              <input id="pl-heat-stress" type="checkbox" class="form-check-input" role="switch" />
+              <label class="form-check-label fw-semibold" for="pl-heat-stress">
+                ☀️ Heat Stress Protection
+              </label>
+              <div class="text-muted small">Avoids mowing during the hottest midday hours when the daily maximum temperature exceeds the threshold, and extends the minimum interval between sessions to let the lawn recover.</div>
+            </div>
+            <div class="row g-2 mb-2 ms-3">
+              <div class="col-6 col-sm-3">
+                <label class="form-label small">Trigger temp</label>
+                <div class="input-group input-group-sm">
+                  <input id="pl-hs-temp" type="number" class="form-control" value="28" min="15" max="45" step="0.5" />
+                  <span class="input-group-text">°C</span>
+                </div>
+              </div>
+              <div class="col-6 col-sm-3">
+                <label class="form-label small">No-mow from</label>
+                <div class="input-group input-group-sm">
+                  <input id="pl-hs-start" type="number" class="form-control" value="11" min="0" max="23" step="1" />
+                  <span class="input-group-text">h</span>
+                </div>
+              </div>
+              <div class="col-6 col-sm-3">
+                <label class="form-label small">No-mow until</label>
+                <div class="input-group input-group-sm">
+                  <input id="pl-hs-end" type="number" class="form-control" value="17" min="1" max="24" step="1" />
+                  <span class="input-group-text">h</span>
+                </div>
+              </div>
+              <div class="col-6 col-sm-3">
+                <label class="form-label small">Reduced interval</label>
+                <div class="input-group input-group-sm">
+                  <input id="pl-hs-interval" type="number" class="form-control" value="2" min="1" max="7" step="1" />
+                  <span class="input-group-text">days</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="form-check form-switch mb-2 mt-3">
+              <input id="pl-dew" type="checkbox" class="form-check-input" role="switch" />
+              <label class="form-check-label fw-semibold" for="pl-dew">
+                💧 Dew Avoidance
+              </label>
+              <div class="text-muted small">Delays mowing until dew has evaporated. Auto mode estimates the dew duration from dew-point, humidity, temperature and wind in the forecast.</div>
+            </div>
+            <div class="row g-2 mb-2 ms-3">
+              <div class="col-12">
+                <div class="form-check form-switch">
+                  <input id="pl-dew-auto" type="checkbox" class="form-check-input" role="switch" checked />
+                  <label class="form-check-label small" for="pl-dew-auto">Auto-estimate from forecast (dew point &amp; humidity)</label>
+                </div>
+              </div>
+              <div class="col-6 col-sm-4">
+                <label class="form-label small">Max offset after sunrise</label>
+                <div class="input-group input-group-sm">
+                  <input id="pl-dew-hours" type="number" class="form-control" value="2.0" min="0.25" max="4" step="0.25" />
+                  <span class="input-group-text">h</span>
+                </div>
+                <div class="form-text small">Cap (auto) or fixed offset (manual).</div>
+              </div>
+            </div>
+
             <hr>
             <div class="form-check form-switch mb-2">
               <input id="pl-watchdog" type="checkbox" class="form-check-input" role="switch" />
@@ -1326,6 +1388,14 @@ async function loadPlannerConfig() {
     document.getElementById('pl-temp').value = cfg.min_temp_celsius ?? 5;
     document.getElementById('pl-rain-delay').value = cfg.rain_delay_minutes ?? 0;
     document.getElementById('pl-hedgehog').checked = !!cfg.hedgehog_protection;
+    document.getElementById('pl-heat-stress').checked = !!cfg.heat_stress_protection;
+    document.getElementById('pl-hs-temp').value = cfg.heat_stress_temp_celsius ?? 28;
+    document.getElementById('pl-hs-start').value = cfg.heat_stress_no_mow_start_hour ?? 11;
+    document.getElementById('pl-hs-end').value = cfg.heat_stress_no_mow_end_hour ?? 17;
+    document.getElementById('pl-hs-interval').value = cfg.heat_stress_interval_days ?? 2;
+    document.getElementById('pl-dew').checked = !!cfg.dew_avoidance_enabled;
+    document.getElementById('pl-dew-auto').checked = cfg.dew_avoidance_auto !== false;
+    document.getElementById('pl-dew-hours').value = cfg.dew_avoidance_hours_after_sunrise ?? 2.0;
     document.getElementById('pl-watchdog').checked = !!cfg.watchdog_enabled;
     document.getElementById('pl-watchdog-interval').value = cfg.watchdog_interval_minutes ?? 5;
 
@@ -1448,6 +1518,14 @@ async function savePlannerConfig() {
     min_temp_celsius: parseFloat(document.getElementById('pl-temp').value) ?? 5,
     rain_delay_minutes: parseInt(document.getElementById('pl-rain-delay').value) || 0,
     hedgehog_protection: document.getElementById('pl-hedgehog').checked,
+    heat_stress_protection: document.getElementById('pl-heat-stress').checked,
+    heat_stress_temp_celsius: parseFloat(document.getElementById('pl-hs-temp').value) || 28,
+    heat_stress_no_mow_start_hour: parseInt(document.getElementById('pl-hs-start').value) || 11,
+    heat_stress_no_mow_end_hour: parseInt(document.getElementById('pl-hs-end').value) || 17,
+    heat_stress_interval_days: parseInt(document.getElementById('pl-hs-interval').value) || 2,
+    dew_avoidance_enabled: document.getElementById('pl-dew').checked,
+    dew_avoidance_auto: document.getElementById('pl-dew-auto').checked,
+    dew_avoidance_hours_after_sunrise: parseFloat(document.getElementById('pl-dew-hours').value) || 2.0,
     watchdog_enabled: document.getElementById('pl-watchdog').checked,
     watchdog_interval_minutes: parseInt(document.getElementById('pl-watchdog-interval').value) || 5,
     available_windows: windows,
@@ -1592,6 +1670,8 @@ function renderPlannerLog(logEntries) {
     past_window:  '<span class="badge bg-dark">Past Window</span>',
     short_window: '<span class="badge bg-secondary">Short Window</span>',
     hedgehog:     '<span class="badge bg-success bg-opacity-25 text-dark border">\u{1F994} Hedgehog</span>',
+    heat_stress:  '<span class="badge bg-warning text-dark">&#x2600;&#xFE0F; Heat Stress</span>',
+    dew:          '<span class="badge bg-info text-dark">&#x1F4A7; Dew</span>',
     skip:         '<span class="badge bg-light text-dark border">Skip</span>',
   };
   tbody.innerHTML = logEntries.map(e => {
@@ -1626,7 +1706,13 @@ async function loadPlannerForecast() {
     const minTemp      = cfg.min_temp_celsius  ?? 5.0;
     const rainDelayH   = (cfg.rain_delay_minutes ?? 0) / 60;
     const windows      = cfg.available_windows ?? [];
-    const daily        = fdata.daily || {};   // {date: {sunrise, sunset}}
+    const daily        = fdata.daily || {};   // {date: {sunrise, sunset, temp_max_c, ...}}
+    const heatStress   = cfg.heat_stress_protection ?? false;
+    const hsTempThresh = cfg.heat_stress_temp_celsius ?? 28;
+    const hsStartH     = cfg.heat_stress_no_mow_start_hour ?? 11;
+    const hsEndH       = cfg.heat_stress_no_mow_end_hour   ?? 17;
+    const dewEnabled   = cfg.dew_avoidance_enabled ?? false;
+    const dewHoursMax  = cfg.dew_avoidance_hours_after_sunrise ?? 2.0;
 
     // Convert JS getDay() (0=Sun) → planner DOW (0=Mon)
     const plannerDow = dateStr => (new Date(dateStr).getDay() + 6) % 7;
@@ -1672,6 +1758,24 @@ async function loadPlannerForecast() {
       const sunLine = srStr && ssStr
         ? `<br><small class="text-muted fw-normal">🌅 ${srStr}&nbsp;&nbsp;🌇 ${ssStr}</small>`
         : '';
+      // Heat stress: is this a hot day?
+      const tempMax  = dayInfo.temp_max_c;
+      const isHotDay = heatStress && tempMax != null && tempMax >= hsTempThresh;
+      const hotBadge = isHotDay ? ` <small class="text-warning fw-normal">☀️ ${tempMax.toFixed(0)}°C</small>` : '';
+      // Dew: use the server-estimated value per day (matches what the planner enforces).
+      // Falls back to dewHoursMax if the planner hasn't run yet.
+      const srDate   = dayInfo.sunrise ? new Date(dayInfo.sunrise) : null;
+      const estimatedDewH = dewEnabled && srDate
+        ? (dayInfo.dew_h_estimated != null ? dayInfo.dew_h_estimated : dewHoursMax)
+        : 0;
+      // Compute dew-clear time as "HH:MM" for display in the day cell
+      let dewLine = '';
+      if (dewEnabled && srDate && estimatedDewH > 0) {
+        const clearDecH = srDate.getHours() + srDate.getMinutes() / 60 + estimatedDewH;
+        const clearHH = String(Math.floor(clearDecH) % 24).padStart(2, '0');
+        const clearMM = String(Math.round((clearDecH % 1) * 60)).padStart(2, '0');
+        dewLine = `<br><small class="text-info fw-normal">💧 until ${clearHH}:${clearMM}</small>`;
+      }
 
       // Build set of rain-delay-blocked hours for this day
       const delayBlockedHours = new Set();
@@ -1698,6 +1802,8 @@ async function loadPlannerForecast() {
         const tempBad = p.temp_c  < minTemp;
         const weatherBad  = rainBad || windBad || tempBad;
         const delayBlocked = inWin && !rainBad && delayBlockedHours.has(hour);
+        const isHotZone   = isHotDay && hour >= hsStartH && hour < hsEndH;
+        const isDewBlocked = p.is_dew_phase === true;
 
         let rowClass = '', rowStyle = '';
         if (!inWin) {
@@ -1706,21 +1812,27 @@ async function loadPlannerForecast() {
           rowClass = 'table-secondary';
         } else if (weatherBad) {
           rowClass = 'table-danger';
+        } else if (isHotZone) {
+          rowClass = 'table-warning';
+        } else if (isDewBlocked) {
+          rowClass = 'table-info';
         } else if (p.rain_mm > maxRain * 0.5 || p.wind_ms > maxWind * 0.7) {
           rowClass = 'table-warning';
         }
 
         const emoji      = wmoIcons[parseInt(p.icon)] ?? '🌡️';
         const nightIcon  = !isDay ? ' 🦔' : '';
+        const hotIcon    = isHotZone   ? ' ☀️' : '';
+        const dewIcon    = isDewBlocked ? ' 💧' : '';
         const dayName    = i === 0
           ? ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][new Date(date).getDay()]
           : null;
 
         html += `<tr class="${rowClass}">
           ${i === 0
-            ? `<td rowspan="${periods.length}" class="fw-semibold align-middle">${dayName}<br><span class="fw-normal text-muted small">${date}</span>${sunLine}</td>`
+            ? `<td rowspan="${periods.length}" class="fw-semibold align-middle">${dayName}<br><span class="fw-normal text-muted small">${date}</span>${sunLine}${hotBadge}${dewLine}</td>`
             : ''}
-          <td style="${rowStyle}">${timeStr}</td>
+          <td style="${rowStyle}">${timeStr}${hotIcon}${dewIcon}</td>
           <td style="${rowStyle}">${emoji}${nightIcon} ${escHtml(p.description)}</td>
           <td style="${rowStyle}">${p.temp_c.toFixed(1)}</td>
           <td style="${rowStyle}">${p.rain_mm.toFixed(1)}</td>
@@ -1732,7 +1844,8 @@ async function loadPlannerForecast() {
     html += '</tbody></table></div>';
     html += `<div class="d-flex gap-3 p-2 border-top small text-muted flex-wrap">
       <span><span class="badge bg-danger me-1">&nbsp;</span>Threshold exceeded</span>
-      <span><span class="badge bg-warning text-dark me-1">&nbsp;</span>Near threshold</span>
+      <span><span class="badge bg-warning text-dark me-1">&nbsp;</span>Near threshold / Peak heat</span>
+      <span><span class="badge bg-info text-dark me-1">&nbsp;</span>Dew likely</span>
       <span><span class="badge bg-secondary me-1">&nbsp;</span>Rain delay</span>
       <span style="opacity:0.4">▪</span> Outside mowing window (dimmed)
       <span>🦔 Night (outside daylight)</span>

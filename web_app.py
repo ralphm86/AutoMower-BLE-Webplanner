@@ -18,6 +18,7 @@ import secrets
 import datetime as dt
 from contextlib import asynccontextmanager
 from pathlib import Path
+import time
 from typing import Optional
 
 import uvicorn
@@ -28,7 +29,7 @@ from fastapi.templating import Jinja2Templates
 import bcrypt
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel
-
+import subprocess
 from bleak import BleakScanner
 
 from automower_ble.mower import Mower
@@ -50,7 +51,7 @@ from planner import (
     geocode_city,
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("web_app")
 
 # ─── Authentication ───────────────────────────────────────────────────────────
 _SESSION_COOKIE = "automower_session"
@@ -206,10 +207,20 @@ async def _cleanup_connection() -> None:
     _connected = False
     if _mower is not None:
         m, _mower = _mower, None
+        logger.info("Cleanup: disconnecting mower %s", m.address)
         try:
             await m.disconnect()
         except Exception as exc:
-            logger.warning("Mower cleanup error (ignored): %s", exc)
+            logger.warning("Mower disconnect error (ignored): %s", exc)
+        try:
+            result = subprocess.run(
+                ["bluetoothctl", "disconnect", m.address],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            logger.debug("bluetoothctl disconnect: %s", result.stdout.strip() or result.stderr.strip())
+        except Exception as exc:
+            logger.debug("bluetoothctl cleanup failed: %s", exc)
+        logger.info("Cleanup: mower %s disconnected", m.address)
 
 
 async def _reconnect_loop() -> None:
@@ -243,7 +254,31 @@ async def _reconnect_loop() -> None:
             logger.info("Auto-reconnect: scanning for %s ...", addr)
             device = await BleakScanner.find_device_by_address(addr, timeout=_SCAN_TIMEOUT)
             if device is None:
-                logger.debug("Auto-reconnect: %s not in range", addr)
+                # Device not visible in scan — could be a BlueZ zombie connection
+                # where BlueZ still holds the link even though Bleak has given up.
+                # In that state the mower is not discoverable until BlueZ releases it.
+                try:
+                    info = subprocess.run(
+                        ["bluetoothctl", "info", addr],
+                        capture_output=True, text=True, timeout=5, check=False,
+                    )
+                    if "Connected: yes" in info.stdout:
+                        logger.warning(
+                            "Auto-reconnect: %s is zombie-connected in BlueZ — "
+                            "forcing bluetoothctl disconnect...",
+                            addr,
+                        )
+                        subprocess.run(
+                            ["bluetoothctl", "disconnect", addr],
+                            timeout=5, check=False,
+                        )
+                        # BlueZ needs a moment to process the disconnect before
+                        # the device becomes scannable again; the 30 s sleep at
+                        # the top of the next loop iteration provides that gap.
+                    else:
+                        logger.debug("Auto-reconnect: %s not in range", addr)
+                except Exception as exc:
+                    logger.debug("Auto-reconnect: bluetoothctl check failed: %s", exc)
                 continue
 
             logger.info("Auto-reconnect: found %s, connecting ...", addr)
@@ -292,17 +327,32 @@ watchdog.set_mower_provider(lambda: _mower)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _reconnect_task, _sampler_task
+    # Re-apply our logging config: uvicorn calls configure_logging() internally
+    # during startup which resets the handlers we set before uvicorn.run().
+    # Calling here guarantees our format is active for all subsequent output.
+    _configure_app_logging(_log_level_str, _log_file, _log_max_mb, _log_backups)
     # Startup
     _load_reconnect_state()
     _load_runtime_samples()
     _reconnect_task = asyncio.create_task(_reconnect_loop())
     _sampler_task = asyncio.create_task(_sampler_loop())
     cfg = planner_load_config()
+    logger.info(
+        "═══ AutoMower-BLE starting ═══  "
+        "auth=%s  planner=%s  watchdog=%s  "
+        "reconnect_target=%s  samples=%d",
+        "on" if _auth_hash else "off",
+        "enabled" if cfg.get("enabled") else "disabled",
+        "enabled" if cfg.get("watchdog_enabled") else "disabled",
+        _reconnect_cfg.get("address") if _reconnect_cfg else "none",
+        len(_runtime_samples),
+    )
     if cfg.get("enabled"):
         planner.start()
     watchdog.start()  # always running; gated internally by watchdog_enabled flag
     yield
     # Shutdown
+    logger.info("AutoMower-BLE shutdown")
     if _reconnect_task:
         _reconnect_task.cancel()
     if _sampler_task:
@@ -466,6 +516,10 @@ async def connect_mower(req: ConnectRequest):
         if result == ResponseResult.OK:
             _mower = candidate
             _connected = True
+            logger.info(
+                "Connected: address=%s  channel_id=%d  pin=%s",
+                req.address, req.channel_id, "yes" if req.pin else "no",
+            )
             # Sync mower clock to local time immediately after pairing
             try:
                 await _mower.set_time()
@@ -499,6 +553,7 @@ async def disconnect_mower():
     """Disconnect from the currently connected mower."""
     global _mower, _connected, _reconnect_enabled
     _require_connection()
+    addr = _mower.address
     await _mower.disconnect()
     _mower = None
     _connected = False
@@ -512,11 +567,10 @@ async def disconnect_mower():
 async def sync_time():
     """Synchronise the mower's internal clock to the current local time."""
     _require_connection()
+    local_time = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     await _mower.set_time()
-    return {
-        "status": "ok",
-        "local_time": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
+    logger.info("Time sync: mower=%s  local_time=%s", _mower.address, local_time)
+    return {"status": "ok", "local_time": local_time}
 
 
 @app.post("/api/reconnect/toggle")
@@ -860,6 +914,7 @@ async def command_mow(req: MowRequest):
     _require_connection()
     if req.duration_hours <= 0:
         raise HTTPException(422, "duration_hours must be > 0")
+    logger.info("CMD mow: duration=%.1f h  mower=%s", req.duration_hours, _mower.address)
     await _mower.mower_override(req.duration_hours)
     return {"status": "ok", "action": "mow", "duration_hours": req.duration_hours}
 
@@ -868,6 +923,7 @@ async def command_mow(req: MowRequest):
 async def command_pause():
     """Pause the mower."""
     _require_connection()
+    logger.info("CMD pause  mower=%s", _mower.address)
     await _mower.mower_pause()
     return {"status": "ok", "action": "pause"}
 
@@ -1080,6 +1136,14 @@ class PlannerConfigRequest(BaseModel):
     watchdog_enabled: bool = False
     watchdog_interval_minutes: int = 5
     hedgehog_protection: bool = False
+    heat_stress_protection: bool = False
+    heat_stress_temp_celsius: float = 28.0
+    heat_stress_no_mow_start_hour: int = 11
+    heat_stress_no_mow_end_hour: int = 17
+    heat_stress_interval_days: int = 2
+    dew_avoidance_enabled: bool = False
+    dew_avoidance_auto: bool = True
+    dew_avoidance_hours_after_sunrise: float = 2.0
 
 
 @app.get("/api/planner/config")
@@ -1177,6 +1241,68 @@ async def watchdog_check_now():
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
+_APP_LOGGERS = ("web_app", "automower_ble", "planner", "uvicorn", "uvicorn.error", "uvicorn.access")
+
+# Module-level storage so lifespan can re-apply logging after uvicorn's
+# internal configure_logging() runs and may reset our handlers.
+_log_level_str: str = "info"
+_log_file: Optional[str] = None
+_log_max_mb: int = 10
+_log_backups: int = 5
+
+
+def _configure_app_logging(
+    level_str: str,
+    log_file: Optional[str] = None,
+    log_max_mb: int = 10,
+    log_backups: int = 5,
+) -> None:
+    """
+    Configure logging for every automower logger independently of the root
+    logger so that uvicorn's own logging initialisation (which calls
+    logging.config.dictConfig and may reset root-logger handlers) does not
+    silence our output.
+
+    Each automower logger gets its own StreamHandler plus an optional
+    RotatingFileHandler.  propagate=False prevents double-printing via root.
+    """
+    level = getattr(logging, level_str.upper())
+    fmt = logging.Formatter(
+        "%(levelname)s: %(asctime)s  %(name)-28s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+
+    if log_file:
+        from logging.handlers import RotatingFileHandler
+        fh = RotatingFileHandler(
+            log_file,
+            maxBytes=log_max_mb * 1024 * 1024,
+            backupCount=log_backups,
+            encoding="utf-8",
+        )
+        handlers.append(fh)
+
+    for h in handlers:
+        h.setFormatter(fmt)
+        h.setLevel(level)
+
+    for name in _APP_LOGGERS:
+        lg = logging.getLogger(name)
+        lg.setLevel(level)
+        lg.handlers = []          # clear any handlers added at import time
+        for h in handlers:
+            lg.addHandler(h)
+        lg.propagate = False      # don't double-print via root logger
+
+    if log_file:
+        logging.getLogger("web_app").info(
+            "File logging active: %s  (max %d MB × %d backup(s))",
+            log_file, log_max_mb, log_backups,
+        )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Automower BLE Web Interface")
     parser.add_argument(
@@ -1203,6 +1329,27 @@ if __name__ == "__main__":
         help="Secret for signing session cookies (or set SECRET_KEY env var). "
              "Defaults to a random value — sessions expire on restart.",
     )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        metavar="PATH",
+        help="Write logs to this rotating file in addition to stderr "
+             "(e.g. --log-file automower.log). Useful for multi-day diagnostics.",
+    )
+    parser.add_argument(
+        "--log-max-mb",
+        type=int,
+        default=10,
+        metavar="MB",
+        help="Maximum size in MB before the log file is rotated (default: 10).",
+    )
+    parser.add_argument(
+        "--log-backups",
+        type=int,
+        default=5,
+        metavar="N",
+        help="Number of rotated log files to keep (default: 5 → up to 50 MB total).",
+    )
     args = parser.parse_args()
 
     # CLI args take precedence over env vars (already applied at import time).
@@ -1216,9 +1363,23 @@ if __name__ == "__main__":
             "Pass --password <pw> or set AUTH_PASSWORD to enable authentication."
         )
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper()),
-        format="%(asctime)-15s %(name)-8s %(levelname)s: %(message)s",
+    _configure_app_logging(
+        args.log_level,
+        log_file=args.log_file,
+        log_max_mb=args.log_max_mb,
+        log_backups=args.log_backups,
     )
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
+    # Store params so lifespan can re-apply after uvicorn's internal setup.
+    _log_level_str = args.log_level
+    _log_file      = args.log_file
+    _log_max_mb    = args.log_max_mb
+    _log_backups   = args.log_backups
+
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level=args.log_level,
+        log_config=None,   # prevent uvicorn from resetting our log handlers
+    )

@@ -53,7 +53,10 @@ Details on the reverse-engineering process: https://www.alistair23.me/2024/01/06
 - **Clock sync** — mower clock synced to local time on every connect
 - **Weather planner** — fetches hourly forecasts from [Open-Meteo](https://open-meteo.com) (free, no API key), computes optimal mowing slots respecting rain, wind, temperature, and rain-delay constraints, pushes the schedule to the mower
 - **Weather watchdog** — polls *current* conditions every N minutes; parks the mower (HOME mode) if a thunderstorm or threshold breach is detected mid-session, resumes automatically when conditions clear
+- **Runtime estimator** — samples battery level and activity every minute; derives discharge/charge rates and estimates mowing vs charging breakdown for a planned session
+- **Password authentication** — optional session-cookie login page (bcrypt + signed cookie); enabled with `--password` or the `AUTH_PASSWORD` env var
 - **Flash wear protection** — schedule is only written to the mower when it actually changes
+- **Auto-load on tab switch** — each tab automatically fetches fresh data when opened (while connected)
 
 ---
 
@@ -75,13 +78,22 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 
 pip install --upgrade pip
-pip install bleak bleak_retry_connector fastapi uvicorn jinja2 python-multipart
+pip install bleak bleak_retry_connector fastapi uvicorn jinja2 python-multipart \
+            itsdangerous bcrypt
 pip install -e .
 
 python web_app.py --host 127.0.0.1 --port 8080
 ```
 
 Open **http://127.0.0.1:8080** in your browser.
+
+> **Optional:** protect the UI with a password:
+> ```bash
+> python web_app.py --host 127.0.0.1 --port 8080 --password "yourpassword"
+> # or via environment variable:
+> AUTH_PASSWORD=yourpassword python web_app.py
+> ```
+> When a password is set, an `automower_session` cookie (8 h, HttpOnly, signed) is issued on successful login.
 
 ### Raspberry Pi Zero 2W (headless server)
 
@@ -105,7 +117,8 @@ source .venv/bin/activate
 
 # 5. Dependencies
 pip install --upgrade pip
-pip install bleak bleak_retry_connector fastapi uvicorn jinja2 python-multipart
+pip install bleak bleak_retry_connector fastapi uvicorn jinja2 python-multipart \
+            itsdangerous bcrypt
 pip install -e .
 
 # 6. First run (test)
@@ -129,6 +142,10 @@ After=bluetooth.target network.target
 User=pi
 WorkingDirectory=/home/pi/AutoMower-BLE
 ExecStart=/home/pi/AutoMower-BLE/.venv/bin/python web_app.py --host 0.0.0.0 --port 8080
+# Optional: protect with a password
+# Environment=AUTH_PASSWORD=yourpassword
+# Optional: stable session tokens across restarts (otherwise sessions expire on restart)
+# Environment=SECRET_KEY=a-long-random-string
 Restart=on-failure
 RestartSec=5
 
@@ -145,6 +162,37 @@ sudo systemctl start automower
 sudo systemctl status automower
 sudo journalctl -u automower -f
 ```
+
+---
+
+## Authentication
+
+The web UI can be protected with a single password. When enabled, all routes (except `/login` and `/static/*`) require a valid session cookie.
+
+| Option | Description |
+|---|---|
+| `--password <pw>` | Set via CLI argument |
+| `AUTH_PASSWORD=<pw>` | Set via environment variable (useful for systemd) |
+| `--secret-key <s>` | Override the signing secret for session cookies (sessions survive restarts) |
+| `SECRET_KEY=<s>` | Same, via environment variable |
+
+**Security properties:**
+- Passwords hashed with **bcrypt** (no plaintext stored in memory)
+- Session cookie is `HttpOnly`, `SameSite=Lax`, 8 hours max-age, signed with `itsdangerous`
+- Per-IP rate-limiting: 5 failed attempts per 5 minutes
+- If `--password` is **not** set, auth is disabled and a warning is logged (suitable for trusted LAN use)
+
+---
+
+## Runtime Estimator
+
+The **Statistics** tab includes a runtime estimator that learns from observed battery samples:
+
+- The sampler background task records battery level, activity, and charging state every 60 seconds while connected (`runtime_samples.json`, max 2,000 entries ≈ 33 h)
+- From completed mowing and charging segments it derives **discharge rate** (%/h), **charge rate** (%/h), and the **return-to-station battery threshold**
+- If insufficient sample data exists it falls back to lifetime averages from the mower's own statistics
+- The **Estimate** button projects mowing hours, charging hours, and number of charge stops for any planned session duration
+- Samples survive restarts; use the **🗑️** button to reset and start fresh
 
 ---
 

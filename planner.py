@@ -60,6 +60,16 @@ DEFAULT_CONFIG: dict = {
     "watchdog_interval_minutes": 5,
     # Hedgehog protection: restrict mowing to daylight hours (sunrise–sunset)
     "hedgehog_protection": False,
+    # Heat stress protection: avoid mowing during peak heat; reduce frequency on hot days
+    "heat_stress_protection": False,
+    "heat_stress_temp_celsius": 28.0,        # daily max temp that triggers heat stress mode
+    "heat_stress_no_mow_start_hour": 11,    # start of midday no-mow zone
+    "heat_stress_no_mow_end_hour": 17,      # end of midday no-mow zone
+    "heat_stress_interval_days": 2,         # min days between mows on hot days
+    # Dew avoidance: delay mowing start until dew has evaporated
+    "dew_avoidance_enabled": False,
+    "dew_avoidance_auto": True,             # auto-estimate from forecast; False = fixed offset
+    "dew_avoidance_hours_after_sunrise": 2.0,  # cap (auto) or fixed offset (manual)
     # Runtime state (persisted for display only)
     "last_plan_time": None,
     "last_plan_result": "Never run",
@@ -108,8 +118,8 @@ def _fetch_openmeteo_sync(lat: float, lon: float) -> dict:
     params = urllib.parse.urlencode({
         "latitude": lat,
         "longitude": lon,
-        "hourly": "temperature_2m,precipitation,windspeed_10m,weathercode",
-        "daily": "sunrise,sunset",
+        "hourly": "temperature_2m,precipitation,windspeed_10m,weathercode,dew_point_2m,relative_humidity_2m",
+        "daily": "sunrise,sunset,temperature_2m_max,wind_speed_10m_max",
         "wind_speed_unit": "ms",
         "timezone": "auto",
         "forecast_days": 7,
@@ -134,10 +144,12 @@ def parse_daily(data: dict) -> dict[str, dict]:
     Parse Open-Meteo daily data into {date_str: {"sunrise": datetime, "sunset": datetime}}.
     Times are returned in the local timezone indicated by utc_offset_seconds.
     """
-    daily = data.get("daily", {})
-    times    = daily.get("time", [])
-    sunrises = daily.get("sunrise", [])
-    sunsets  = daily.get("sunset", [])
+    daily      = data.get("daily", {})
+    times      = daily.get("time", [])
+    sunrises   = daily.get("sunrise", [])
+    sunsets    = daily.get("sunset", [])
+    temp_maxes = daily.get("temperature_2m_max", [])
+    wind_maxes = daily.get("wind_speed_10m_max", [])
     utc_offset_sec = data.get("utc_offset_seconds", 0)
     tz = dt.timezone(dt.timedelta(seconds=utc_offset_sec))
     result: dict[str, dict] = {}
@@ -149,7 +161,12 @@ def parse_daily(data: dict) -> dict[str, dict]:
             ss = dt.datetime.fromisoformat(ss_str).replace(tzinfo=tz) if ss_str else None
         except Exception:
             sr = ss = None
-        result[d] = {"sunrise": sr, "sunset": ss}
+        result[d] = {
+            "sunrise":    sr,
+            "sunset":     ss,
+            "temp_max_c": float(temp_maxes[i]) if i < len(temp_maxes) and temp_maxes[i] is not None else None,
+            "wind_max_ms": float(wind_maxes[i]) if i < len(wind_maxes) and wind_maxes[i] is not None else None,
+        }
     return result
 
 
@@ -157,11 +174,79 @@ def daily_to_serialisable(daily: dict[str, dict]) -> dict[str, dict]:
     """Convert {date: {sunrise/sunset: datetime}} to JSON-serialisable form."""
     return {
         d: {
-            "sunrise": v["sunrise"].isoformat() if v.get("sunrise") else None,
-            "sunset":  v["sunset"].isoformat()  if v.get("sunset")  else None,
+            "sunrise":        v["sunrise"].isoformat() if v.get("sunrise") else None,
+            "sunset":         v["sunset"].isoformat()  if v.get("sunset")  else None,
+            "temp_max_c":     v.get("temp_max_c"),
+            "wind_max_ms":    v.get("wind_max_ms"),
+            "dew_h_estimated": v.get("dew_h_estimated"),  # set by run_once; None before first run
         }
         for d, v in daily.items()
     }
+
+
+def _estimate_dew_hours(
+    periods: list[dict],
+    date: dt.date,
+    sunrise: dt.datetime,
+    max_dew_h: float,
+) -> float:
+    """
+    Two-phase dew duration estimator.
+
+    Phase 1 — Did dew form? (3 h before sunrise)
+      Uses temperature–dewpoint gap and relative humidity.
+      f_gap  = clamp((2 − gap_min) / 5, 0, 1) × 0.6
+      f_rh   = clamp((rh_max − 65) / 35, 0, 1) × 0.4
+      dew_score = f_gap + f_rh  (0–1)
+      If dew_score < 0.25 → no dew, return 0.0.
+
+    Phase 2 — How fast does it evaporate? (2 h after sunrise)
+      f_evap = clamp((T_morn − 8) / 22, 0, 1) × 0.6
+             + clamp(W_morn / 8, 0, 1)         × 0.4
+      dew_h  = max_dew_h × dew_score × (1 − 0.7 × f_evap)
+      Clamped to [0.25 h, max_dew_h] when dew is present.
+    """
+    pre_start = sunrise - dt.timedelta(hours=3)
+    pre_periods = [p for p in periods if pre_start <= p["dt"] < sunrise]
+
+    if not pre_periods:
+        return max_dew_h  # no data — conservatively assume dew
+
+    # Phase 1: dew formation score
+    gaps = [
+        p["temp_c"] - p["dew_point_c"]
+        for p in pre_periods
+        if p.get("dew_point_c") is not None
+    ]
+    humids = [p["humidity_pct"] for p in pre_periods if p.get("humidity_pct") is not None]
+
+    gap_min = min(gaps)  if gaps  else 0.0    # no dew-point data → worst case
+    rh_max  = max(humids) if humids else 100.0
+
+    f_gap = max(0.0, min(1.0, (2.0 - gap_min) / 5.0)) * 0.6
+    f_rh  = max(0.0, min(1.0, (rh_max - 65.0) / 35.0)) * 0.4
+    dew_score = f_gap + f_rh
+
+    if dew_score < 0.25:
+        return 0.0  # no significant dew formed
+
+    # Phase 2: evaporation rate
+    post_end = sunrise + dt.timedelta(hours=2)
+    post_periods = [p for p in periods if sunrise <= p["dt"] < post_end]
+
+    if post_periods:
+        t_morn = sum(p["temp_c"]  for p in post_periods) / len(post_periods)
+        w_morn = sum(p["wind_ms"] for p in post_periods) / len(post_periods)
+    else:
+        t_morn, w_morn = 15.0, 0.0
+
+    f_evap = (
+        max(0.0, min(1.0, (t_morn - 8.0) / 22.0)) * 0.6
+        + max(0.0, min(1.0, w_morn / 8.0))         * 0.4
+    )
+
+    dew_h = max_dew_h * dew_score * (1.0 - 0.7 * f_evap)
+    return max(0.25, min(max_dew_h, dew_h))
 
 
 def _geocode_openmeteo_sync(city: str) -> list[dict]:
@@ -217,10 +302,12 @@ def parse_forecast(data: dict) -> list[dict]:
     """Convert Open-Meteo hourly forecast to plain dicts with local datetimes."""
     hourly = data.get("hourly", {})
     times  = hourly.get("time", [])
-    temps  = hourly.get("temperature_2m", [])
-    rains  = hourly.get("precipitation", [])
-    winds  = hourly.get("windspeed_10m", [])
-    codes  = hourly.get("weathercode", [])
+    temps   = hourly.get("temperature_2m", [])
+    rains   = hourly.get("precipitation", [])
+    winds   = hourly.get("windspeed_10m", [])
+    codes   = hourly.get("weathercode", [])
+    dew_pts = hourly.get("dew_point_2m", [])
+    humids  = hourly.get("relative_humidity_2m", [])
 
     utc_offset_sec = data.get("utc_offset_seconds", 0)
     tz = dt.timezone(dt.timedelta(seconds=utc_offset_sec))
@@ -236,6 +323,8 @@ def parse_forecast(data: dict) -> list[dict]:
             "wind_ms":     float(winds[i]) if i < len(winds) else 0.0,
             "description": _WMO_DESCRIPTIONS.get(wmo, f"code {wmo}"),
             "icon":        str(wmo),
+            "dew_point_c":  float(dew_pts[i]) if i < len(dew_pts) and dew_pts[i] is not None else None,
+            "humidity_pct": float(humids[i])  if i < len(humids) and humids[i]  is not None else None,
         })
     return periods
 
@@ -418,6 +507,15 @@ def plan_schedule(
     min_temp = float(config.get("min_temp_celsius", 5.0))
     rain_delay_sec = int(config.get("rain_delay_minutes", 0)) * 60
 
+    heat_stress_enabled      = bool(config.get("heat_stress_protection", False))
+    heat_stress_temp         = float(config.get("heat_stress_temp_celsius", 28.0))
+    heat_stress_no_mow_start = int(config.get("heat_stress_no_mow_start_hour", 11))
+    heat_stress_no_mow_end   = int(config.get("heat_stress_no_mow_end_hour", 17))
+    heat_stress_interval     = max(interval_days, int(config.get("heat_stress_interval_days", 2)))
+    dew_enabled = bool(config.get("dew_avoidance_enabled", False))
+    dew_auto    = bool(config.get("dew_avoidance_auto", True))
+    max_dew_h   = float(config.get("dew_avoidance_hours_after_sunrise", 2.0))
+
     windows: list[dict] = config.get("available_windows", [])
 
     tasks: list[TaskInformation] = []
@@ -444,11 +542,22 @@ def plan_schedule(
             _log("no_window", "No time window configured")
             continue
 
+        # 1b. Heat stress: determine effective mowing interval for this day
+        is_heat_stress_day = False
+        effective_interval = interval_days
+        if heat_stress_enabled and daily:
+            t_max = daily.get(date.isoformat(), {}).get("temp_max_c")
+            if t_max is not None and t_max >= heat_stress_temp:
+                is_heat_stress_day = True
+                effective_interval = heat_stress_interval
+
         # 2. Interval constraint
-        if last_mow_date is not None and (date - last_mow_date).days < interval_days:
+        if last_mow_date is not None and (date - last_mow_date).days < effective_interval:
             _log(
                 "interval",
-                f"Interval: {interval_days}d min, last was {last_mow_date.strftime('%a %d %b')}",
+                f"Interval: {effective_interval}d min"
+                + (" ☀️ heat stress" if is_heat_stress_day else "")
+                + f", last was {last_mow_date.strftime('%a %d %b')}",
             )
             continue
 
@@ -519,6 +628,59 @@ def plan_schedule(
                     search_start_sec = w_start_h * 3600
             else:
                 search_start_sec = w_start_h * 3600
+
+            # ── Dew avoidance: push earliest start past dew evaporation time ──────────
+            if dew_enabled and daily:
+                sr_dt = daily.get(date.isoformat(), {}).get("sunrise")
+                if sr_dt:
+                    dew_h = (
+                        _estimate_dew_hours(forecast_periods, date, sr_dt, max_dew_h)
+                        if dew_auto
+                        else max_dew_h
+                    )
+                    if dew_h > 0.0:
+                        dew_clear_sec = (
+                            sr_dt.hour * 3600 + sr_dt.minute * 60 + int(dew_h * 3600)
+                        )
+                        if dew_clear_sec >= w_end_h * 3600:
+                            fail_status = "dew"
+                            fail_reason = (
+                                f"Dew avoidance: dew clears at "
+                                f"{dew_clear_sec // 3600:02d}:{(dew_clear_sec % 3600) // 60:02d}"
+                                f", past window end"
+                            )
+                            continue
+                        search_start_sec = max(search_start_sec, dew_clear_sec)
+                        w_start_h = max(w_start_h, dew_clear_sec // 3600)
+
+            # ── Heat stress: clip no-mow zone from window ───────────────────────────
+            if is_heat_stress_day:
+                hs_s = heat_stress_no_mow_start
+                hs_e = heat_stress_no_mow_end
+                if w_end_h > hs_s and w_start_h < hs_e:
+                    if w_end_h > hs_e:
+                        # Extends past hot zone → prefer afternoon/evening
+                        w_start_h = max(w_start_h, hs_e)
+                        search_start_sec = max(search_start_sec, hs_e * 3600)
+                    elif w_start_h < hs_s:
+                        # Starts before hot zone, ends inside → keep morning only
+                        w_end_h = hs_s
+                    else:
+                        # Entirely within hot zone → skip this window
+                        fail_status = "heat_stress"
+                        fail_reason = (
+                            f"Heat stress: window within no-mow zone "
+                            f"{hs_s:02d}:00–{hs_e:02d}:00"
+                        )
+                        continue
+                    # Re-check viability after clipping
+                    if (w_end_h - w_start_h) * 3600 < min_dur_sec:
+                        fail_status = "heat_stress"
+                        fail_reason = (
+                            f"Heat stress: clipped window {w_start_h:02d}:00–{w_end_h:02d}:00 "
+                            f"too short (min {min_dur_sec // 60} min)"
+                        )
+                        continue
 
             # Keep finding sub-windows within this window until target is met
             # (mower firmware allows at most 2 tasks per day across all windows)
@@ -625,6 +787,10 @@ class PlannerAgent:
         self.last_forecast: list[dict] = []
         self.last_daily: dict = {}
         self._last_pushed_fp: Optional[list[tuple]] = None  # None = not yet verified against mower
+        # Tasks computed but not yet pushed (mower busy or disconnected at plan time).
+        # The retry loop attempts to push these every 2 min when conditions are safe.
+        self._pending_tasks: Optional[list] = None
+        self._retry_task: Optional[asyncio.Task] = None
 
     def set_mower_provider(self, provider: Callable) -> None:
         """Register a callable that returns the current Mower (or None)."""
@@ -636,18 +802,20 @@ class PlannerAgent:
     def start(self) -> None:
         if not self.is_running():
             self._stop_event = asyncio.Event()
-            self._bg_task = asyncio.create_task(self._loop())
+            self._bg_task   = asyncio.create_task(self._loop())
+            self._retry_task = asyncio.create_task(self._retry_push_loop())
             logger.info("PlannerAgent started")
 
     async def stop(self) -> None:
         if self._stop_event:
             self._stop_event.set()
-        if self._bg_task and not self._bg_task.done():
-            self._bg_task.cancel()
-            try:
-                await self._bg_task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._bg_task, self._retry_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         logger.info("PlannerAgent stopped")
 
     async def run_once(self) -> str:
@@ -667,11 +835,39 @@ class PlannerAgent:
 
         periods = parse_forecast(data)
         daily   = parse_daily(data)
-        # Annotate each hourly period with an is_daylight flag for the UI
+
+        # Pre-compute per-day dew hours (same logic as plan_schedule) so that
+        # is_dew_phase on each period reflects exactly what the planner enforces.
+        dew_enabled_cfg = bool(config.get("dew_avoidance_enabled", False))
+        dew_auto_cfg    = bool(config.get("dew_avoidance_auto", True))
+        max_dew_h_cfg   = float(config.get("dew_avoidance_hours_after_sunrise", 2.0))
+        _day_dew_h: dict[str, float] = {}
+        for date_str, info in daily.items():
+            sr = info.get("sunrise")
+            if dew_enabled_cfg and sr:
+                try:
+                    _d = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
+                    _day_dew_h[date_str] = (
+                        _estimate_dew_hours(periods, _d, sr, max_dew_h_cfg)
+                        if dew_auto_cfg else max_dew_h_cfg
+                    )
+                except Exception:
+                    _day_dew_h[date_str] = max_dew_h_cfg
+            else:
+                _day_dew_h[date_str] = 0.0
+            info["dew_h_estimated"] = _day_dew_h[date_str]
+
+        # Annotate each hourly period with is_daylight and is_dew_phase for the UI
         for p in periods:
-            day_info = daily.get(p["dt"].strftime("%Y-%m-%d"), {})
+            date_str = p["dt"].strftime("%Y-%m-%d")
+            day_info = daily.get(date_str, {})
             sr, ss = day_info.get("sunrise"), day_info.get("sunset")
             p["is_daylight"] = (sr <= p["dt"] < ss) if (sr and ss) else True
+            dew_h = _day_dew_h.get(date_str, 0.0)
+            if dew_enabled_cfg and sr and dew_h > 0.0:
+                p["is_dew_phase"] = p["dt"] < sr + dt.timedelta(hours=dew_h)
+            else:
+                p["is_dew_phase"] = False
         self.last_forecast = forecast_to_serialisable(periods)
         self.last_daily    = daily_to_serialisable(daily)
 
@@ -685,6 +881,7 @@ class PlannerAgent:
 
             # Fast path: in-memory fingerprint matches — no BLE traffic needed
             if new_fp == self._last_pushed_fp:
+                self._pending_tasks = None  # already up to date
                 msg += " — schedule unchanged (cached), push skipped"
             else:
                 # Check mower activity before doing anything
@@ -697,8 +894,9 @@ class PlannerAgent:
                 _SAFE = {MowerActivity.PARKED, MowerActivity.CHARGING, MowerActivity.NONE}
                 if activity not in _SAFE:
                     act_name = activity.name if activity else "unknown"
+                    self._pending_tasks = tasks  # will retry when mower is safe
                     msg += (f" — push skipped: mower is {act_name} "
-                            f"(only push when PARKED / CHARGING)")
+                            f"(retry pending)")
                 else:
                     # Read-before-write: pull the real schedule and compare
                     try:
@@ -716,11 +914,14 @@ class PlannerAgent:
                         try:
                             await mower.set_schedule(tasks)
                             self._last_pushed_fp = new_fp
+                            self._pending_tasks = None
                             msg += " — schedule pushed to mower ✓"
                         except Exception as e:
+                            self._pending_tasks = tasks  # will retry
                             msg += f" — push failed: {e}"
         else:
-            msg += " — mower not connected (not pushed)"
+            self._pending_tasks = tasks  # will retry when mower connects
+            msg += " — mower not connected (push pending retry)"
 
         now_str = dt.datetime.now().isoformat(timespec="seconds")
         self.last_run = now_str
@@ -730,6 +931,67 @@ class PlannerAgent:
         save_config(config)
 
         return self._set_result(msg)
+
+    async def _retry_push_loop(self) -> None:
+        """
+        Retry loop: every 2 minutes, attempt to push ``_pending_tasks`` to the
+        mower if it is now connected and in a safe state (PARKED / CHARGING).
+
+        This covers two cases that ``run_once`` cannot handle itself:
+          1. Mower was disconnected at plan time — reconnect triggered by the
+             user manually (auto-reconnect triggers a full ``run_once`` instead).
+          2. Mower was mowing at plan time — no event fires when mowing ends.
+        """
+        _RETRY_INTERVAL_S = 120
+        _SAFE = {MowerActivity.PARKED, MowerActivity.CHARGING, MowerActivity.NONE}
+        while self._stop_event and not self._stop_event.is_set():
+            # Sleep in small chunks so the stop_event is checked promptly.
+            slept = 0.0
+            while slept < _RETRY_INTERVAL_S:
+                if self._stop_event.is_set():
+                    return
+                await asyncio.sleep(min(15.0, _RETRY_INTERVAL_S - slept))
+                slept += 15.0
+
+            if self._pending_tasks is None:
+                continue
+
+            mower = self._get_mower() if self._get_mower else None
+            if mower is None or not mower.is_connected():
+                continue
+
+            try:
+                activity = await mower.mower_activity()
+            except Exception as e:
+                logger.debug("Planner retry: could not read activity: %s", e)
+                continue
+
+            if activity not in _SAFE:
+                logger.debug(
+                    "Planner retry: mower is %s — not safe to push yet",
+                    activity.name if activity else "unknown",
+                )
+                continue
+
+            pending_fp = _tasks_fingerprint(self._pending_tasks)
+            if pending_fp == self._last_pushed_fp:
+                # Another path already pushed an equivalent schedule.
+                self._pending_tasks = None
+                continue
+
+            try:
+                current_tasks = await mower.get_all_tasks()
+                if _tasks_fingerprint(current_tasks) == pending_fp:
+                    self._last_pushed_fp = pending_fp
+                    self._pending_tasks = None
+                    logger.info("Planner retry: mower already has correct schedule")
+                else:
+                    await mower.set_schedule(self._pending_tasks)
+                    self._last_pushed_fp = pending_fp
+                    self._pending_tasks = None
+                    logger.info("Planner retry: schedule pushed to mower ✓")
+            except Exception as e:
+                logger.warning("Planner retry push failed: %s", e)
 
     def _set_result(self, msg: str) -> str:
         self.last_result = msg
