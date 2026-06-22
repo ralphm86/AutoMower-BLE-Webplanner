@@ -142,9 +142,12 @@
   <div id="sec-status" class="section">
     <div class="d-flex justify-content-between align-items-center mb-3">
       <h5 class="mb-0">Mower Status</h5>
-      <button class="btn btn-secondary btn-sm" onclick="loadStatus()">
-        <i class="bi bi-arrow-clockwise me-1"></i>Refresh
-      </button>
+      <div class="d-flex align-items-center gap-2">
+        <span id="tab-ts-sec-status" class="text-muted small"></span>
+        <button class="btn btn-secondary btn-sm" onclick="_runTabLoader('sec-status')">
+          <i class="bi bi-arrow-clockwise me-1"></i>Refresh
+        </button>
+      </div>
     </div>
     <div id="status-content">
       <p class="text-muted">Connect to a mower first, then click <strong>Refresh</strong>.</p>
@@ -238,7 +241,8 @@
     <div class="d-flex justify-content-between align-items-center mb-3">
       <h5 class="mb-0">Weekly Schedule</h5>
       <div class="d-flex gap-2">
-        <button class="btn btn-secondary btn-sm" onclick="loadSchedule()">
+        <span id="tab-ts-sec-schedule" class="text-muted small"></span>
+        <button class="btn btn-secondary btn-sm" onclick="_runTabLoader('sec-schedule')">
           <i class="bi bi-arrow-clockwise me-1"></i>Refresh
         </button>
         <button class="btn btn-success btn-sm" onclick="addTaskRow()">
@@ -289,9 +293,12 @@
   <div id="sec-stats" class="section">
     <div class="d-flex justify-content-between align-items-center mb-3">
       <h5 class="mb-0">Usage Statistics</h5>
-      <button class="btn btn-secondary btn-sm" onclick="loadStats()">
-        <i class="bi bi-arrow-clockwise me-1"></i>Refresh
-      </button>
+      <div class="d-flex align-items-center gap-2">
+        <span id="tab-ts-sec-stats" class="text-muted small"></span>
+        <button class="btn btn-secondary btn-sm" onclick="_runTabLoader('sec-stats')">
+          <i class="bi bi-arrow-clockwise me-1"></i>Refresh
+        </button>
+      </div>
     </div>
     <div id="stats-content">
       <p class="text-muted">Connect to a mower first, then click <strong>Refresh</strong>.</p>
@@ -679,9 +686,12 @@
   <div id="sec-messages" class="section">
     <div class="d-flex justify-content-between align-items-center mb-3">
       <h5 class="mb-0">Message Log</h5>
-      <button class="btn btn-secondary btn-sm" onclick="loadMessages()">
-        <i class="bi bi-arrow-clockwise me-1"></i>Refresh
-      </button>
+      <div class="d-flex align-items-center gap-2">
+        <span id="tab-ts-sec-messages" class="text-muted small"></span>
+        <button class="btn btn-secondary btn-sm" onclick="_runTabLoader('sec-messages')">
+          <i class="bi bi-arrow-clockwise me-1"></i>Refresh
+        </button>
+      </div>
     </div>
     <div id="messages-content">
       <p class="text-muted">Connect to a mower first, then click <strong>Refresh</strong>.</p>
@@ -702,39 +712,66 @@
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script>
-// ─── Tab navigation ──────────────────────────────────────────────────────────
-let _plannerRefreshTimer = null;
+// ─── Tab auto-refresh ─────────────────────────────────────────────────────────
+const _AUTO_REFRESH_MS = 30000;
+const _tabTimers = {};        // section → intervalId
+let _plannerConfigLoaded = false;
 
-const _tabLoaders = {
-  'sec-status':   () => _isConnected && loadStatus(),
-  'sec-commands': () => {},
-  'sec-schedule': () => _isConnected && loadSchedule(),
-  'sec-stats':    () => _isConnected && loadStats(),
-  'sec-messages': () => _isConnected && loadMessages(),
-  'sec-planner':  () => {
-    loadPlannerConfig();
-    loadPlannerStatus();
-    if (!_plannerRefreshTimer) {
-      _plannerRefreshTimer = setInterval(loadPlannerStatus, 30000);
-    }
+// What each tab loads on activation and every 30 s.
+// Planner only auto-refreshes status+watchdog; config is user-edited.
+const _tabAutoLoaders = {
+  'sec-status':   async () => { if (_isConnected) await loadStatus(); },
+  'sec-schedule': async () => { if (_isConnected) await loadSchedule(); },
+  'sec-stats':    async () => { if (_isConnected) await loadStats(); },
+  'sec-messages': async () => { if (_isConnected) await loadMessages(); },
+  'sec-planner':  async () => {
+    if (!_plannerConfigLoaded) { await loadPlannerConfig(); _plannerConfigLoaded = true; }
+    await loadPlannerStatus();
+    await loadWatchdogStatus();
   },
 };
 
+function _updateTabTimestamp(section) {
+  const el = document.getElementById('tab-ts-' + section);
+  if (el) el.textContent = 'Updated ' + new Date().toLocaleTimeString();
+}
+
+async function _runTabLoader(section) {
+  const loader = _tabAutoLoaders[section];
+  if (!loader) return;
+  const tsEl = document.getElementById('tab-ts-' + section);
+  if (tsEl) tsEl.innerHTML = '<span class="spinner-border spinner-border-sm me-1 text-secondary align-middle" style="width:.8em;height:.8em"></span>';
+  await loader();
+  _updateTabTimestamp(section);
+}
+
+function _stopTabTimer(section) {
+  if (_tabTimers[section]) {
+    clearInterval(_tabTimers[section]);
+    delete _tabTimers[section];
+  }
+}
+
+function _startTabTimer(section) {
+  _stopTabTimer(section);
+  _tabTimers[section] = setInterval(() => _runTabLoader(section), _AUTO_REFRESH_MS);
+}
+
 document.querySelectorAll('#main-tabs .nav-link').forEach(link => {
   link.addEventListener('click', e => {
+    const prev = document.querySelector('#main-tabs .nav-link.active')?.dataset.section;
     document.querySelectorAll('#main-tabs .nav-link').forEach(l => l.classList.remove('active'));
     document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
     link.classList.add('active');
-    document.getElementById(link.dataset.section).classList.add('active');
+    const section = link.dataset.section;
+    document.getElementById(section).classList.add('active');
 
-    // Stop planner timer when leaving the planner tab
-    if (link.dataset.section !== 'sec-planner' && _plannerRefreshTimer) {
-      clearInterval(_plannerRefreshTimer);
-      _plannerRefreshTimer = null;
-    }
+    // Stop timer for the tab we're leaving
+    if (prev && prev !== section) _stopTabTimer(prev);
 
-    // Auto-load tab content
-    _tabLoaders[link.dataset.section]?.();
+    // Load data immediately on first visit, then start cyclic refresh
+    _runTabLoader(section);
+    _startTabTimer(section);
   });
 });
 
@@ -925,11 +962,9 @@ async function syncTime() {
 // ─── Status ───────────────────────────────────────────────────────────────────
 async function loadStatus() {
   const el = document.getElementById('status-content');
-  el.innerHTML = '<div class="spinner-border spinner-border-sm text-success"></div> Loading…';
+  if (!el.innerHTML.trim()) el.innerHTML = '<div class="spinner-border spinner-border-sm text-success me-2"></div>Loading…';
   try {
-    showSpinner();
     const s = await api('GET', '/api/status');
-    hideSpinner();
 
     const battClass = s.battery_level >= 50 ? 'success' : s.battery_level >= 20 ? 'warning' : 'danger';
     const stateColor = {
@@ -970,9 +1005,41 @@ async function loadStatus() {
                   <span class="fw-semibold">${escHtml(s.activity || '—')}</span>
                   <div class="text-muted small">${escHtml(s.activity_description || '')}</div>
                 </dd>
-                <dt class="col-sm-5">Charging</dt>  <dd class="col-sm-7">${s.charging ? '⚡ Yes' : 'No'}</dd>
+                <dt class="col-sm-5">Mode</dt>
+                <dd class="col-sm-7">
+                  ${s.mode === 'AUTO'
+                    ? '<span class="badge bg-success">AUTO</span>'
+                    : s.mode === 'HOME'
+                      ? '<span class="badge bg-dark">HOME</span>'
+                      : s.mode === 'MANUAL'
+                        ? '<span class="badge bg-secondary">MANUAL</span>'
+                        : `<span class="badge bg-secondary">${escHtml(s.mode || '—')}</span>`}
+                  ${s.mode != null && s.mode !== 'AUTO'
+                    ? '<div class="text-warning small fw-semibold">⚠ Not AUTO — schedule may not run</div>'
+                    : ''}
+                </dd>
+                <dt class="col-sm-5">Restriction</dt>
+                <dd class="col-sm-7">${s.restriction_reason && s.restriction_reason !== 'None'
+                  ? `<span class="text-warning fw-semibold">${escHtml(s.restriction_reason)}</span>`
+                  : '<span class="text-muted">None</span>'}</dd>
+                <dt class="col-sm-5">Charging</dt>
+                <dd class="col-sm-7">
+                  ${s.charging
+                    ? `⚡ Yes${s.remaining_charging_min != null
+                        ? ` <span class="text-muted small">(${s.remaining_charging_min >= 60
+                            ? Math.floor(s.remaining_charging_min / 60) + 'h ' + Math.round(s.remaining_charging_min % 60) + 'm'
+                            : Math.round(s.remaining_charging_min) + ' min'} remaining)</span>`
+                        : ''}`
+                    : 'No'}
+                </dd>
                 <dt class="col-sm-5">Next Start</dt>
-                <dd class="col-sm-7">${s.next_start_time ? fmtDateTime(s.next_start_time) : '—'}</dd>
+                <dd class="col-sm-7">
+                  ${s.next_start_time
+                    ? fmtDateTime(s.next_start_time)
+                    : s.estimated_next_start_time
+                      ? `<span class="text-muted">~${fmtDateTime(s.estimated_next_start_time)} <small>(est. from charge time)</small></span>`
+                      : '—'}
+                </dd>
                 <dt class="col-sm-5">Cutting Height</dt>
                 <dd class="col-sm-7">${s.cutting_height_cm != null ? s.cutting_height_cm + ' cm' : '—'}</dd>
               </dl>
@@ -1011,7 +1078,6 @@ async function loadStatus() {
         </div>
       </div>`;
   } catch (e) {
-    hideSpinner();
     el.innerHTML = `<div class="alert alert-danger">Failed to load status: ${escHtml(e.message)}</div>`;
   }
 }
@@ -1061,12 +1127,10 @@ async function setCuttingHeight() {
 // ─── Schedule ─────────────────────────────────────────────────────────────────
 async function loadSchedule() {
   const tbody = document.getElementById('schedule-body');
-  tbody.innerHTML = `<tr><td colspan="10" class="text-center">
+  if (!tbody.innerHTML.trim()) tbody.innerHTML = `<tr><td colspan="10" class="text-center">
     <div class="spinner-border spinner-border-sm text-success me-2"></div>Loading…</td></tr>`;
   try {
-    showSpinner();
     const data = await api('GET', '/api/schedule');
-    hideSpinner();
     tbody.innerHTML = '';
     if (!data.tasks || !data.tasks.length) {
       tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted py-3">No tasks configured.</td></tr>';
@@ -1074,7 +1138,6 @@ async function loadSchedule() {
     }
     data.tasks.forEach(t => addTaskRowData(t));
   } catch (e) {
-    hideSpinner();
     tbody.innerHTML = `<tr><td colspan="10"><div class="alert alert-danger mb-0">
       Failed to load: ${escHtml(e.message)}</div></td></tr>`;
   }
@@ -1168,11 +1231,9 @@ async function saveSchedule() {
 // ─── Statistics ───────────────────────────────────────────────────────────────
 async function loadStats() {
   const el = document.getElementById('stats-content');
-  el.innerHTML = '<div class="spinner-border spinner-border-sm text-success"></div> Loading…';
+  if (!el.innerHTML.trim()) el.innerHTML = '<div class="spinner-border spinner-border-sm text-success me-2"></div> Loading…';
   try {
-    showSpinner();
     const s = await api('GET', '/api/statistics');
-    hideSpinner();
 
     // Blade wear colour
     const bladeColor = s.blade_wear_pct >= 90 ? 'danger' : s.blade_wear_pct >= 70 ? 'warning' : 'secondary';
@@ -1210,7 +1271,6 @@ async function loadStats() {
         ${s.remaining_charging_time_min != null ? statCard('bi-plug', 'Remaining Charge', s.remaining_charging_time_min + ' min', 'warning') : ''}
       </div>`;
   } catch (e) {
-    hideSpinner();
     el.innerHTML = `<div class="alert alert-danger">Failed: ${escHtml(e.message)}</div>`;
   }
 }
@@ -1330,11 +1390,9 @@ async function clearRuntimeSamples() {
 // ─── Messages ─────────────────────────────────────────────────────────────────
 async function loadMessages() {
   const el = document.getElementById('messages-content');
-  el.innerHTML = '<div class="spinner-border spinner-border-sm text-success"></div> Loading…';
+  if (!el.innerHTML.trim()) el.innerHTML = '<div class="spinner-border spinner-border-sm text-success me-2"></div> Loading…';
   try {
-    showSpinner();
     const data = await api('GET', '/api/messages?count=20');
-    hideSpinner();
     if (!data.messages || !data.messages.length) {
       el.innerHTML = '<p class="text-muted">No messages in log.</p>';
       return;
@@ -1359,7 +1417,6 @@ async function loadMessages() {
     html += '</div>';
     el.innerHTML = html;
   } catch (e) {
-    hideSpinner();
     el.innerHTML = `<div class="alert alert-danger">Failed: ${escHtml(e.message)}</div>`;
   }
 }

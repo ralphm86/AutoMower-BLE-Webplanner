@@ -780,6 +780,9 @@ class PlannerAgent:
         self._bg_task: Optional[asyncio.Task] = None
         self._stop_event: Optional[asyncio.Event] = None
         self._get_mower: Optional[Callable] = None
+        # Set by web_app after the first startup reconnect attempt so the
+        # planner loop waits for the mower to be reachable before the first push.
+        self._startup_event: Optional[asyncio.Event] = None
 
         self.last_log: list[dict] = []
         self.last_run: Optional[str] = None
@@ -795,6 +798,10 @@ class PlannerAgent:
     def set_mower_provider(self, provider: Callable) -> None:
         """Register a callable that returns the current Mower (or None)."""
         self._get_mower = provider
+
+    def set_startup_event(self, event: asyncio.Event) -> None:
+        """Supply an event that is set when the startup connect attempt completes."""
+        self._startup_event = event
 
     def is_running(self) -> bool:
         return bool(self._bg_task and not self._bg_task.done())
@@ -1023,6 +1030,16 @@ class PlannerAgent:
 
     async def _loop(self) -> None:
         """Background loop: plan, then sleep until the next scheduled wakeup."""
+        # Wait for the startup reconnect attempt to complete so the first
+        # run_once() can actually push to the mower immediately.
+        if self._startup_event is not None:
+            try:
+                await asyncio.wait_for(self._startup_event.wait(), timeout=60.0)
+                logger.info("Planner: startup connect attempt done, proceeding with first run")
+            except asyncio.TimeoutError:
+                logger.warning("Planner: timed out waiting for startup connect (60 s), proceeding anyway")
+            self._startup_event = None  # one-shot
+
         while self._stop_event and not self._stop_event.is_set():
             config = load_config()
             if config.get("enabled"):

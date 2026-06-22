@@ -164,6 +164,13 @@ class Mower(BLEClient):
             return None
         return MowerActivity(activity)
 
+    async def mower_mode(self) -> ModeOfOperation | None:
+        """Query the current mode of operation."""
+        mode = await self.command("GetMode")
+        if mode is None:
+            return None
+        return ModeOfOperation(mode)
+
     async def mower_override(self, duration_hours: float = 3.0) -> None:
         """
         Force the mower to run for the specified duration in hours.
@@ -185,6 +192,9 @@ class Mower(BLEClient):
 
     async def mower_resume(self):
         # The response validation is expected to fail
+        # Set mode of operation to auto:
+        await self.command("SetMode", mode=ModeOfOperation.AUTO)
+        await self.command("ClearOverride")
         await self.command("StartTrigger")
 
     async def mower_park(self):
@@ -224,7 +234,12 @@ class Mower(BLEClient):
         """
         Replace the full mowing schedule with the given list of tasks.
         Uses a task transaction: StartTaskTransaction → DeleteAllTask →
-        AddTask × N → CommitTaskTransaction.
+        AddTask × N → CommitTaskTransaction → StartTrigger.
+
+        StartTrigger is sent after CommitTaskTransaction so the mower
+        immediately re-evaluates the new schedule.  Without it the mower
+        stays in IN_OPERATION/PARKED_IN_CS and does not pick up the new
+        start time until the next internal wake-up cycle.
         """
         await self.command("StartTaskTransaction")
         await self.command("DeleteAllTask")
@@ -242,6 +257,9 @@ class Mower(BLEClient):
                 useOnSunday=int(bool(task.on_sunday)),
             )
         await self.command("CommitTaskTransaction")
+        # Prompt the mower to re-evaluate the schedule immediately.
+        # Response validation is expected to fail for StartTrigger.
+        await self.command("StartTrigger")
 
     async def get_task(self, taskid: int) -> TaskInformation | None:
         """

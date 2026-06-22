@@ -117,6 +117,9 @@ _RECONNECT_CONFIG_PATH = Path("reconnect_config.json")
 _reconnect_cfg: Optional[dict] = None
 _reconnect_enabled: bool = False   # user-controlled toggle
 _reconnect_task: Optional[asyncio.Task] = None
+# Set after the first startup connect attempt (success or fail) so the
+# planner knows it is safe to proceed with the first schedule push.
+_startup_connect_done: Optional[asyncio.Event] = None
 
 # ─── Runtime sampler ──────────────────────────────────────────────────────────
 _SAMPLES_PATH = Path("runtime_samples.json")
@@ -228,28 +231,33 @@ async def _reconnect_loop() -> None:
     global _mower, _connected
     _SCAN_TIMEOUT = 8.0
     _RETRY_INTERVAL = 30.0
+    _first = True  # skip initial sleep; attempt connection immediately on startup
 
     while True:
-        await asyncio.sleep(_RETRY_INTERVAL)
-
-        if not _reconnect_enabled or not _reconnect_cfg:
-            continue
-
-        # Sync stale flag: BLE dropped without going through /api/disconnect.
-        # Use _cleanup_connection() so the old BleakClient is properly torn
-        # down and bleak-retry-connector stops auto-reconnecting at the OS level.
-        if _connected and (_mower is None or not _mower.is_connected()):
-            logger.info("Auto-reconnect: detected unexpected disconnect")
-            await _cleanup_connection()
-
-        if _connected:
-            continue  # already connected
-
-        # Skip if /api/connect is already running a connect attempt.
-        if _connection_lock.locked():
-            continue
+        if _first:
+            _first = False
+            logger.info("Auto-reconnect: startup — attempting immediate connect")
+        else:
+            await asyncio.sleep(_RETRY_INTERVAL)
 
         try:
+            if not _reconnect_enabled or not _reconnect_cfg:
+                continue
+
+            # Sync stale flag: BLE dropped without going through /api/disconnect.
+            # Use _cleanup_connection() so the old BleakClient is properly torn
+            # down and bleak-retry-connector stops auto-reconnecting at the OS level.
+            if _connected and (_mower is None or not _mower.is_connected()):
+                logger.info("Auto-reconnect: detected unexpected disconnect")
+                await _cleanup_connection()
+
+            if _connected:
+                continue  # already connected
+
+            # Skip if /api/connect is already running a connect attempt.
+            if _connection_lock.locked():
+                continue
+
             addr = _reconnect_cfg["address"]
             logger.info("Auto-reconnect: scanning for %s ...", addr)
             device = await BleakScanner.find_device_by_address(addr, timeout=_SCAN_TIMEOUT)
@@ -296,7 +304,30 @@ async def _reconnect_loop() -> None:
                     except Exception:
                         pass
                     continue
-                result = await candidate.connect(device)
+                try:
+                    result = await candidate.connect(device)
+                except Exception as ce:
+                    # connect() raised (e.g. response parsing error after BLE link
+                    # was already established).  The BLE connection is live at the OS
+                    # level but _mower / _connected were never set, so we must tear it
+                    # down explicitly — otherwise the next scan sees a new zombie.
+                    logger.warning(
+                        "Auto-reconnect: connect() raised exception for %s — "
+                        "tearing down BLE link: %s",
+                        addr, ce,
+                    )
+                    try:
+                        await candidate.disconnect()
+                    except Exception:
+                        pass
+                    try:
+                        subprocess.run(
+                            ["bluetoothctl", "disconnect", addr],
+                            timeout=5, check=False,
+                        )
+                    except Exception:
+                        pass
+                    raise  # re-raise so the outer except logs and the loop retries
                 if result == ResponseResult.OK:
                     _mower = candidate
                     _connected = True
@@ -315,6 +346,11 @@ async def _reconnect_loop() -> None:
                         pass
         except Exception as exc:
             logger.warning("Auto-reconnect error: %s", exc)
+        finally:
+            # Signal the planner that the startup connect window has closed,
+            # regardless of whether the attempt succeeded, failed, or was skipped.
+            if _startup_connect_done is not None and not _startup_connect_done.is_set():
+                _startup_connect_done.set()
 
 # ─── Planner agent ────────────────────────────────────────────────────────────
 planner = PlannerAgent()
@@ -326,7 +362,7 @@ watchdog.set_mower_provider(lambda: _mower)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _reconnect_task, _sampler_task
+    global _reconnect_task, _sampler_task, _startup_connect_done
     # Re-apply our logging config: uvicorn calls configure_logging() internally
     # during startup which resets the handlers we set before uvicorn.run().
     # Calling here guarantees our format is active for all subsequent output.
@@ -334,6 +370,12 @@ async def lifespan(app: FastAPI):
     # Startup
     _load_reconnect_state()
     _load_runtime_samples()
+    # Startup connect event: signals the planner when the first reconnect
+    # attempt is done so it doesn't try to push before the mower is reachable.
+    _startup_connect_done = asyncio.Event()
+    if not _reconnect_enabled or not _reconnect_cfg:
+        # No reconnect configured — planner may proceed immediately.
+        _startup_connect_done.set()
     _reconnect_task = asyncio.create_task(_reconnect_loop())
     _sampler_task = asyncio.create_task(_sampler_loop())
     cfg = planner_load_config()
@@ -348,6 +390,7 @@ async def lifespan(app: FastAPI):
         len(_runtime_samples),
     )
     if cfg.get("enabled"):
+        planner.set_startup_event(_startup_connect_done)
         planner.start()
     watchdog.start()  # always running; gated internally by watchdog_enabled flag
     yield
@@ -619,11 +662,38 @@ async def get_status():
     manufacturer = await _mower.get_manufacturer()
     model = await _mower.get_model()
     error_code = await _mower.command("GetError")
+    mode = await _mower.mower_mode()
+    restriction_raw = await _mower.command("GetRestrictionReason")
+
+    # When the mower is charging there is no native next_start_time.
+    # Estimate it from the remaining charging time so the UI stays informative.
+    estimated_next_start: Optional[dt.datetime] = None
+    remaining_charging_min: Optional[float] = None
+    if charging:
+        rem_s = await _mower.command("GetRemainingChargingTime")
+        if rem_s:
+            remaining_charging_min = round(rem_s / 60, 1)
+            if next_start is None:
+                estimated_next_start = dt.datetime.now() + dt.timedelta(seconds=rem_s)
 
     try:
         error_name = ErrorCodes(error_code).name if error_code else "NO_ERROR"
     except ValueError:
         error_name = f"UNKNOWN_{error_code}"
+
+    mode_name = mode.name if mode is not None else None
+
+    _RESTRICTION_REASONS = {
+        0: "None",
+        1: "Week schedule",
+        2: "Park override",
+        3: "Sensor",
+        4: "Daily limit",
+    }
+    restriction_reason = (
+        _RESTRICTION_REASONS.get(restriction_raw, f"Code {restriction_raw}")
+        if restriction_raw is not None else None
+    )
 
     return {
         "connected": True,
@@ -636,9 +706,13 @@ async def get_status():
         "state_description": _state_description(state),
         "activity": activity.name if activity is not None else None,
         "activity_description": _activity_description(activity),
+        "mode": mode_name,
+        "restriction_reason": restriction_reason,
         "battery_level": battery,
         "charging": charging,
+        "remaining_charging_min": remaining_charging_min,
         "next_start_time": next_start.isoformat() if next_start else None,
+        "estimated_next_start_time": estimated_next_start.isoformat() if estimated_next_start else None,
         "error_code": error_code,
         "error_name": error_name,
     }
