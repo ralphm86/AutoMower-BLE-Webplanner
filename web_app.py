@@ -49,6 +49,10 @@ from planner import (
     save_config as planner_save_config,
     DEFAULT_CONFIG as PLANNER_DEFAULT_CONFIG,
     geocode_city,
+    record_mowing_day,
+    get_mow_sec_today,
+    load_mow_history,
+    save_mow_history,
 )
 
 logger = logging.getLogger("web_app")
@@ -110,6 +114,7 @@ _init_auth(os.environ.get("AUTH_PASSWORD"), os.environ.get("SECRET_KEY"))
 _mower: Optional[Mower] = None
 _connected: bool = False
 _connection_lock = asyncio.Lock()   # serialises connect / disconnect operations
+_server_start_time: Optional[dt.datetime] = None
 
 # ─── Auto-reconnect ───────────────────────────────────────────────────────────
 _RECONNECT_CONFIG_PATH = Path("reconnect_config.json")
@@ -128,6 +133,24 @@ _SAMPLE_INTERVAL_S = 60
 
 _runtime_samples: list[dict] = []
 _sampler_task: Optional[asyncio.Task] = None
+
+# ─── Mow session tracking ────────────────────────────────────────────────────
+# Track the start of the current mowing session so completed runs are written
+# to mow_history.json for accurate planner seed-date and progress deduction.
+_mow_session_start_ts: Optional[float] = None  # epoch when current mow started
+_mow_session_date: Optional[dt.date] = None     # date the current session started
+_prev_sample_activity: Optional[int] = None     # previous sample's activity.value
+
+# ─── BLE idle sleep ───────────────────────────────────────────────────────────
+# Disconnect BLE automatically when no web user has been active for a while
+# and the mower is parked (not mowing, not charging).  The reconnect loop
+# re-establishes the link the moment a web request comes in or the planner
+# has pending tasks to push.
+_last_web_activity: float = 0.0   # epoch; updated by middleware on each request
+_ble_idle_suspend: bool = False   # True = reconnect loop skips new connections
+_idle_disconnect_task: Optional[asyncio.Task] = None
+_BLE_IDLE_TIMEOUT_S: int = 300    # seconds of web inactivity before disconnect
+_BLE_IDLE_CHECK_S: int = 60       # how often the idle checker polls
 
 
 def _load_reconnect_state() -> None:
@@ -169,9 +192,61 @@ def _save_runtime_samples() -> None:
         logger.warning("Failed to save runtime samples: %s", exc)
 
 
+def _rebuild_mow_history_from_samples() -> None:
+    """
+    Scan in-memory runtime samples for completed mowing segments and write
+    them to mow_history.json.  Called once at startup to recover any sessions
+    that were not recorded due to a crash or BLE idle-sleep disconnect.
+
+    Only updates history entries where the sample-derived total exceeds what
+    is already on record (never overwrites richer history with less data).
+    """
+    if not _runtime_samples:
+        return
+    history = load_mow_history()
+    day_mow: dict[str, int] = {}   # date_str → mow seconds from samples
+    mow_val = MowerActivity.MOWING.value
+    seg_start: Optional[int] = None
+    seg_date: Optional[dt.date] = None
+    prev_act: Optional[int] = None
+
+    for s in _runtime_samples:
+        act_val: int = s["activity"]
+        ts: int = s["ts"]
+        if act_val == mow_val and prev_act != mow_val:
+            seg_start = ts
+            seg_date = dt.datetime.fromtimestamp(ts).date()
+        elif act_val != mow_val and prev_act == mow_val:
+            if seg_start is not None and seg_date is not None:
+                dur = ts - seg_start
+                date_str = seg_date.isoformat()
+                day_mow[date_str] = day_mow.get(date_str, 0) + dur
+            seg_start = None
+            seg_date = None
+        prev_act = act_val
+    # An open segment at the end of samples is intentionally left out — the
+    # sampler loop will write it when the session ends.
+
+    updated = False
+    for date_str, sample_sec in day_mow.items():
+        existing = history.get(date_str, {}).get("mow_sec", 0)
+        if sample_sec > existing:
+            history[date_str] = {
+                "mow_sec": sample_sec,
+                "complete": False,
+                "last_updated": dt.datetime.now().isoformat(timespec="seconds"),
+            }
+            logger.info(
+                "Mow history backfilled from samples: %s = %ds", date_str, sample_sec,
+            )
+            updated = True
+    if updated:
+        save_mow_history(history)
+
+
 async def _sampler_loop() -> None:
     """Background task: record (timestamp, battery, activity, charging) every minute."""
-    global _runtime_samples
+    global _runtime_samples, _mow_session_start_ts, _mow_session_date, _prev_sample_activity
     while True:
         await asyncio.sleep(_SAMPLE_INTERVAL_S)
         if not _connected or _mower is None:
@@ -184,10 +259,34 @@ async def _sampler_loop() -> None:
             )
             if battery is None or activity is None:
                 continue
+            sample_ts = int(dt.datetime.now().timestamp())
+            act_val = activity.value
+            mow_val = MowerActivity.MOWING.value
+
+            # Detect mowing session start
+            if act_val == mow_val and _prev_sample_activity != mow_val:
+                _mow_session_start_ts = float(sample_ts)
+                _mow_session_date = dt.date.today()
+                logger.debug("Sampler: mowing session started on %s", _mow_session_date)
+
+            # Detect mowing session end
+            elif act_val != mow_val and _prev_sample_activity == mow_val:
+                if _mow_session_start_ts is not None and _mow_session_date is not None:
+                    duration_sec = sample_ts - int(_mow_session_start_ts)
+                    if duration_sec >= 60:
+                        record_mowing_day(_mow_session_date, duration_sec, complete=True)
+                        logger.info(
+                            "Sampler: mowing session ended — %.0f min on %s",
+                            duration_sec / 60, _mow_session_date,
+                        )
+                _mow_session_start_ts = None
+                _mow_session_date = None
+
+            _prev_sample_activity = act_val
             _runtime_samples.append({
-                "ts": int(dt.datetime.now().timestamp()),
+                "ts": sample_ts,
                 "battery": battery,
-                "activity": activity.value,
+                "activity": act_val,
                 "charging": bool(charging),
             })
             if len(_runtime_samples) > _MAX_SAMPLES:
@@ -196,6 +295,68 @@ async def _sampler_loop() -> None:
             logger.debug("Sampler: battery=%d%% activity=%s", battery, activity.name)
         except Exception as exc:
             logger.debug("Sampler error (ignored): %s", exc)
+
+
+async def _idle_disconnect_loop() -> None:
+    """
+    Energy-saving background task: disconnect BLE when all three conditions hold:
+      1. No web browser has sent a request in the last _BLE_IDLE_TIMEOUT_S seconds.
+      2. The mower is parked / idle (not mowing and not going out).
+      3. The mower is not currently charging.
+
+    While BLE is idle-suspended the reconnect loop is suppressed.  Reconnect
+    resumes automatically as soon as a new web request arrives OR the planner
+    has pending tasks that need to be pushed.
+    """
+    global _ble_idle_suspend
+    _IDLE_STATES = {MowerActivity.PARKED, MowerActivity.NONE}
+    while True:
+        await asyncio.sleep(_BLE_IDLE_CHECK_S)
+
+        # If already suspended: lift the ban when a web user comes back or the
+        # planner needs the connection for a pending schedule push.
+        if _ble_idle_suspend:
+            web_back = (time.time() - _last_web_activity) < _BLE_IDLE_TIMEOUT_S
+            planner_needs = planner._pending_tasks is not None
+            if web_back or planner_needs:
+                _ble_idle_suspend = False
+                reason = "web activity" if web_back else "planner pending tasks"
+                logger.info("BLE idle sleep: %s detected — auto-reconnect re-enabled", reason)
+            continue
+
+        if not _connected or _mower is None:
+            continue
+
+        web_idle_s = time.time() - _last_web_activity
+        if web_idle_s < _BLE_IDLE_TIMEOUT_S:
+            continue
+
+        # Web has been idle long enough — check mower state before disconnecting
+        try:
+            activity, charging = await asyncio.gather(
+                _mower.mower_activity(),
+                _mower.is_charging(),
+            )
+        except Exception as exc:
+            logger.debug("BLE idle check: could not read mower state: %s", exc)
+            continue
+
+        if activity in _IDLE_STATES and not charging:
+            # Don't disconnect while a mowing session is active or starting
+            # within the next hour — accurate sampling matters more than energy.
+            if planner._has_session_window_active_or_upcoming():
+                logger.debug(
+                    "BLE idle: mowing session active/upcoming — keeping BLE connection"
+                )
+                continue
+            logger.info(
+                "BLE idle sleep: no web activity for %.0fs, mower is %s — "
+                "disconnecting BLE to save energy",
+                web_idle_s,
+                activity.name if activity else "unknown",
+            )
+            _ble_idle_suspend = True
+            await _cleanup_connection()
 
 
 async def _cleanup_connection() -> None:
@@ -253,6 +414,10 @@ async def _reconnect_loop() -> None:
 
             if _connected:
                 continue  # already connected
+
+            # Skip connection attempts while BLE idle sleep is active.
+            if _ble_idle_suspend:
+                continue
 
             # Skip if /api/connect is already running a connect attempt.
             if _connection_lock.locked():
@@ -337,7 +502,12 @@ async def _reconnect_loop() -> None:
                         await _mower.set_time()
                     except Exception as te:
                         logger.warning("Auto-reconnect: time sync failed: %s", te)
-                    asyncio.create_task(planner.run_once())
+                    if planner.is_replan_due():
+                        asyncio.create_task(planner.run_once())
+                    else:
+                        logger.info(
+                            "Auto-reconnect: planner interval not yet elapsed, skipping replan"
+                        )
                 else:
                     logger.warning("Auto-reconnect: failed (%s)", result.name)
                     try:
@@ -356,13 +526,41 @@ async def _reconnect_loop() -> None:
 planner = PlannerAgent()
 planner.set_mower_provider(lambda: _mower)
 
+
+def _learned_cycle_data() -> Optional[dict]:
+    """
+    Derive avg_mow_h / avg_chg_h from the observed battery discharge/charge
+    rates in *_runtime_samples*.  Returns None when there is not enough sample
+    history to compute reliable rates.
+    """
+    rates = _analyse_samples(_runtime_samples)
+    dr = rates["discharge_rate_pct_per_h"]
+    cr = rates["charge_rate_pct_per_h"]
+    th = rates["return_threshold_pct"]
+    if dr and cr and th is not None:
+        usable = 100.0 - th
+        return {
+            "avg_mow_h": usable / dr,
+            "avg_chg_h": usable / cr,
+        }
+    return None
+
+
+planner.set_cycle_data_provider(_learned_cycle_data)
+planner.set_mow_today_provider(lambda: get_mow_sec_today() + (
+    int(time.time() - _mow_session_start_ts)
+    if _mow_session_start_ts is not None and _mow_session_date == dt.date.today()
+    else 0
+))
+
 watchdog = WeatherWatchdog()
 watchdog.set_mower_provider(lambda: _mower)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _reconnect_task, _sampler_task, _startup_connect_done
+    global _reconnect_task, _sampler_task, _startup_connect_done, _idle_disconnect_task, _last_web_activity, _server_start_time
+    _server_start_time = dt.datetime.now()
     # Re-apply our logging config: uvicorn calls configure_logging() internally
     # during startup which resets the handlers we set before uvicorn.run().
     # Calling here guarantees our format is active for all subsequent output.
@@ -370,6 +568,8 @@ async def lifespan(app: FastAPI):
     # Startup
     _load_reconnect_state()
     _load_runtime_samples()
+    _rebuild_mow_history_from_samples()
+    _last_web_activity = time.time()  # treat server start as recent activity
     # Startup connect event: signals the planner when the first reconnect
     # attempt is done so it doesn't try to push before the mower is reachable.
     _startup_connect_done = asyncio.Event()
@@ -378,6 +578,7 @@ async def lifespan(app: FastAPI):
         _startup_connect_done.set()
     _reconnect_task = asyncio.create_task(_reconnect_loop())
     _sampler_task = asyncio.create_task(_sampler_loop())
+    _idle_disconnect_task = asyncio.create_task(_idle_disconnect_loop())
     cfg = planner_load_config()
     logger.info(
         "═══ AutoMower-BLE starting ═══  "
@@ -396,10 +597,9 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown
     logger.info("AutoMower-BLE shutdown")
-    if _reconnect_task:
-        _reconnect_task.cancel()
-    if _sampler_task:
-        _sampler_task.cancel()
+    for t in (_reconnect_task, _sampler_task, _idle_disconnect_task):
+        if t:
+            t.cancel()
     await planner.stop()
     await watchdog.stop()
 
@@ -412,10 +612,19 @@ templates = Jinja2Templates(directory="templates")
 @app.middleware("http")
 async def _auth_middleware(request: Request, call_next):
     """Gate every route behind the session cookie when auth is enabled."""
+    global _last_web_activity, _ble_idle_suspend
+    path = request.url.path
+    # Record web activity for BLE idle sleep on any non-static request.
+    # This covers both authenticated API calls and plain page loads.
+    if not path.startswith("/static/"):
+        _last_web_activity = time.time()
+        if _ble_idle_suspend:
+            _ble_idle_suspend = False
+            logger.info("BLE idle sleep: web request on %s — auto-reconnect re-enabled", path)
+
     if _auth_hash is None:
         # Auth not configured — pass all requests through.
         return await call_next(request)
-    path = request.url.path
     # Public paths: login form + static assets
     if path in ("/login", "/logout") or path.startswith("/static/"):
         return await call_next(request)
@@ -636,6 +845,7 @@ async def connection_status():
     # the BLE link alive at the OS level while the app believes it's gone.
     if _connected and (_mower is None or not _mower.is_connected()):
         await _cleanup_connection()
+    uptime_s = int((dt.datetime.now() - _server_start_time).total_seconds()) if _server_start_time else None
     return {
         "connected": _connected,
         "address": _mower.address if _connected and _mower else None,
@@ -643,6 +853,8 @@ async def connection_status():
         "reconnect_target": _reconnect_cfg.get("address") if _reconnect_cfg else None,
         "saved_channel_id": _reconnect_cfg.get("channel_id") if _reconnect_cfg else None,
         "saved_pin": _reconnect_cfg.get("pin") if _reconnect_cfg else None,
+        "server_started_at": _server_start_time.isoformat(timespec="seconds") if _server_start_time else None,
+        "uptime_seconds": uptime_s,
     }
 
 

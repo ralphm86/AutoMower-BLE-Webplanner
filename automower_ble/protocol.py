@@ -320,7 +320,8 @@ class BLEClient:
 
         if len(data) < 3:
             # We got such a small amount of data, let's try again
-            if chunk := await self._get_response() is None:
+            chunk = await self._get_response()
+            if chunk is None:
                 return None
             data = data + chunk
 

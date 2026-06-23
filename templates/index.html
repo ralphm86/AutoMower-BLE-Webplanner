@@ -46,6 +46,7 @@
       Automower BLE Control
     </span>
     <div class="d-flex align-items-center gap-2">
+      <span id="nav-uptime" class="text-white-50 small d-none" title="Server uptime"><i class="bi bi-clock me-1"></i><span id="nav-uptime-val"></span></span>
       <span id="nav-conn-badge" class="badge bg-danger fs-6">Disconnected</span>
       <form method="post" action="/logout" class="m-0">
         <button type="submit" class="btn btn-outline-light btn-sm" title="Sign out">
@@ -828,6 +829,19 @@ async function refreshConnBadge() {
     // Sync the toggle
     const toggle = document.getElementById('auto-reconnect-toggle');
     if (toggle) toggle.checked = !!data.auto_reconnect;
+    // Uptime display
+    if (data.uptime_seconds != null) {
+      const u = data.uptime_seconds;
+      const d = Math.floor(u / 86400);
+      const h = Math.floor((u % 86400) / 3600);
+      const m = Math.floor((u % 3600) / 60);
+      const parts = [];
+      if (d) parts.push(d + 'd');
+      if (h || d) parts.push(h + 'h');
+      parts.push(m + 'm');
+      document.getElementById('nav-uptime-val').textContent = 'up ' + parts.join(' ');
+      document.getElementById('nav-uptime').classList.remove('d-none');
+    }
     // Pre-populate connection form from saved config
     if (data.reconnect_target) {
       const addrEl = document.getElementById('conn-address');
@@ -1292,7 +1306,7 @@ function statCard(icon, label, value, color) {
 async function loadRuntimeEstimate() {
   const el = document.getElementById('estimate-content');
   const durationH = parseFloat(document.getElementById('est-duration').value) || 3.0;
-  el.innerHTML = '<div class="spinner-border spinner-border-sm text-primary"></div> Computing…';
+  el.innerHTML = '<div class="spinner-border spinner-border-sm text-primary me-2"></div>Computing…';
   try {
     showSpinner();
     const e = await api('GET', `/api/runtime_estimate?duration_hours=${durationH}`);
@@ -1338,35 +1352,99 @@ async function loadRuntimeEstimate() {
 
     const p = e.projection;
     const c = e.cycle;
-    const mowPct  = Math.round(p.estimated_mowing_hours   / durationH * 100);
-    const chgPct  = Math.round(p.estimated_charging_hours / durationH * 100);
-    const otherPct = Math.max(0, 100 - mowPct - chgPct);
+    const totalMin = durationH * 60;
+    const mowMin   = c.avg_mow_h_per_cycle * 60;
+    const chgMin   = c.avg_charge_h_per_cycle * 60;
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
+    function fmtMin(min) {
+      const h = Math.floor(min / 60);
+      const m = Math.round(min % 60);
+      if (h > 0 && m > 0) return `${h}h ${m}m`;
+      if (h > 0) return `${h}h`;
+      return `${m}m`;
+    }
+
+    // ── Build alternating mow/charge segments ─────────────────────────────
+    const segments = [];
+    let rem = totalMin;
+    while (rem > 0.5) {
+      const m = Math.min(rem, mowMin);
+      segments.push({ type: 'mow', min: m });
+      rem -= m;
+      if (rem <= 0.5) break;
+      const ch = Math.min(rem, chgMin);
+      segments.push({ type: 'chg', min: ch });
+      rem -= ch;
+    }
+
+    // ── Timeline bar ─────────────────────────────────────────────────────────
+    const barHtml = segments.map(seg => {
+      const pct  = seg.min / totalMin * 100;
+      const wide = pct > 7;
+      const lbl  = wide ? fmtMin(seg.min) : '';
+      const bg   = seg.type === 'mow' ? '#198754' : '#ffc107';
+      const fg   = seg.type === 'mow' ? 'text-white' : 'text-dark';
+      return `<div class="d-flex align-items-center justify-content-center ${fg} small fw-semibold"
+        style="width:${pct.toFixed(2)}%;background:${bg};overflow:hidden;white-space:nowrap;flex-shrink:0"
+        title="${seg.type === 'mow' ? 'Mowing' : 'Charging'}: ${fmtMin(seg.min)}">${escHtml(lbl)}</div>`;
+    }).join('');
+
+    // ── Time ruler (non-overlapping labels) ───────────────────────────────
+    const rulerLabels = [{ pos: 0, label: '0', anchor: 'left:0' }];
+    let lastPos = 0, elapsedMin = 0;
+    segments.forEach((seg, i) => {
+      elapsedMin += seg.min;
+      if (i < segments.length - 1) {
+        const pos = elapsedMin / totalMin * 100;
+        if (pos - lastPos > 11 && pos < 92) {
+          rulerLabels.push({ pos, label: fmtMin(elapsedMin), anchor: `left:${pos.toFixed(1)}%;transform:translateX(-50%)` });
+          lastPos = pos;
+        }
+      }
+    });
+    rulerLabels.push({ pos: 100, label: durationH + 'h', anchor: 'right:0' });
+
+    const rulerHtml = '<div class="position-relative mb-3" style="height:18px">'
+      + rulerLabels.map(r => `<span class="position-absolute small text-muted" style="${r.anchor}">${escHtml(r.label)}</span>`).join('')
+      + '</div>';
+
+    // ── Session efficiency ────────────────────────────────────────────────
+    const sessEffPct = Math.round(p.estimated_mowing_hours / durationH * 100);
 
     el.innerHTML = `
       ${statusHtml}
-      <div class="mb-3">
-        <div class="d-flex justify-content-between mb-1 small">
-          <span><span class="badge bg-success">Mowing</span> ${p.estimated_mowing_hours} h (${mowPct}%)</span>
-          <span><span class="badge bg-warning text-dark">Charging</span> ${p.estimated_charging_hours} h (${chgPct}%)</span>
-          ${otherPct > 0 ? `<span><span class="badge bg-info text-dark">Other</span> ~${otherPct}%</span>` : ''}
-        </div>
-        <div class="progress" style="height:20px" title="${p.estimated_mowing_hours} h mowing / ${p.estimated_charging_hours} h charging">
-          <div class="progress-bar bg-success" style="width:${mowPct}%">${mowPct > 12 ? p.estimated_mowing_hours + ' h' : ''}</div>
-          <div class="progress-bar bg-warning" style="width:${chgPct}%">${chgPct > 12 ? p.estimated_charging_hours + ' h' : ''}</div>
-          ${otherPct > 0 ? `<div class="progress-bar bg-info" style="width:${otherPct}%"></div>` : ''}
-        </div>
+
+      <!-- ① Timeline -->
+      <div class="fw-semibold small mb-1">Session Timeline — ${durationH} h</div>
+      <div class="d-flex rounded overflow-hidden mb-1" style="height:40px">${barHtml}</div>
+      ${rulerHtml}
+      <div class="d-flex flex-wrap gap-3 mb-4 small text-muted">
+        <span><span class="badge bg-success">&nbsp;</span> Mowing (~${fmtMin(mowMin)} / cycle)</span>
+        <span><span class="badge bg-warning text-dark">&nbsp;</span> Charging (~${fmtMin(chgMin)} / cycle)</span>
       </div>
-      <div class="row g-2 mb-3">
-        ${statCard('bi-battery-charging', 'Charge Stops', p.estimated_charge_stops, 'warning')}
+
+      <!-- ② This-session summary -->
+      <div class="fw-semibold small text-uppercase text-muted mb-2">This Session (${durationH} h)</div>
+      <div class="row g-2 mb-4">
+        ${statCard('bi-scissors', 'Total Mowing', p.estimated_mowing_hours + ' h', 'success')}
+        ${statCard('bi-battery-charging', 'Total Charging', p.estimated_charging_hours + ' h', 'warning')}
+        ${statCard('bi-arrow-repeat', 'Charge Stops', p.estimated_charge_stops, 'warning')}
+        ${statCard('bi-pie-chart', 'Session Efficiency', sessEffPct + ' %', sessEffPct >= 60 ? 'success' : 'secondary')}
+      </div>
+
+      <!-- ③ General performance -->
+      <div class="fw-semibold small text-uppercase text-muted mb-2">Mower Performance (per cycle)</div>
+      <div class="row g-2 mb-2">
+        ${statCard('bi-scissors', 'Avg Mowing', fmtMin(mowMin), 'success')}
+        ${statCard('bi-battery-charging', 'Avg Charging', fmtMin(chgMin), 'warning')}
         ${statCard('bi-pie-chart', 'Mow Efficiency', c.mow_efficiency_pct + ' %', 'success')}
-        ${statCard('bi-clock-history', 'Avg Cycle', c.cycle_total_h + ' h', 'secondary')}
+        ${statCard('bi-clock-history', 'Cycle Length', c.cycle_total_h + ' h', 'secondary')}
+        ${e.rates.discharge_rate_pct_per_h != null ? statCard('bi-battery', 'Discharge Rate', e.rates.discharge_rate_pct_per_h + ' %/h', 'danger') : ''}
+        ${e.rates.charge_rate_pct_per_h    != null ? statCard('bi-plug', 'Charge Rate', e.rates.charge_rate_pct_per_h + ' %/h', 'primary') : ''}
+        ${e.rates.return_threshold_pct     != null ? statCard('bi-battery-half', 'Returns at', '~' + e.rates.return_threshold_pct + ' %', 'secondary') : ''}
       </div>
-      <div class="text-muted small">
-        Data source: ${srcBadge}
-        ${e.rates.discharge_rate_pct_per_h != null ? ` &middot; Discharge: ${e.rates.discharge_rate_pct_per_h} %/h` : ''}
-        ${e.rates.charge_rate_pct_per_h    != null ? ` &middot; Charge: ${e.rates.charge_rate_pct_per_h} %/h` : ''}
-        ${e.rates.return_threshold_pct     != null ? ` &middot; Return threshold: ~${e.rates.return_threshold_pct}%` : ''}
-      </div>`;
+      <div class="text-muted small mt-1">Data source: ${srcBadge}</div>`;
   } catch (ex) {
     hideSpinner();
     el.innerHTML = `<div class="alert alert-danger">Failed: ${escHtml(ex.message)}</div>`;
