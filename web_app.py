@@ -317,7 +317,7 @@ async def _idle_disconnect_loop() -> None:
         # planner needs the connection for a pending schedule push.
         if _ble_idle_suspend:
             web_back = (time.time() - _last_web_activity) < _BLE_IDLE_TIMEOUT_S
-            planner_needs = planner._pending_tasks is not None
+            planner_needs = planner._needs_connection
             if web_back or planner_needs:
                 _ble_idle_suspend = False
                 reason = "web activity" if web_back else "planner pending tasks"
@@ -497,11 +497,15 @@ async def _reconnect_loop() -> None:
                     _mower = candidate
                     _connected = True
                     logger.info("Auto-reconnect: connected to %s ✓", addr)
-                    # Sync clock, then push pending schedule
+                    # Sync clock
                     try:
                         await _mower.set_time()
                     except Exception as te:
                         logger.warning("Auto-reconnect: time sync failed: %s", te)
+                    # In planner mode: ensure placeholder task is installed
+                    _ar_cfg = planner_load_config()
+                    if _ar_cfg.get("enabled"):
+                        asyncio.create_task(planner._install_placeholder_if_needed(_mower))
                     if planner.is_replan_due():
                         asyncio.create_task(planner.run_once())
                     else:
@@ -555,6 +559,7 @@ planner.set_mow_today_provider(lambda: get_mow_sec_today() + (
 
 watchdog = WeatherWatchdog()
 watchdog.set_mower_provider(lambda: _mower)
+watchdog.set_planner_provider(lambda: planner)
 
 
 @asynccontextmanager
@@ -869,10 +874,26 @@ async def get_status():
     battery = await _mower.battery_level()
     charging = await _mower.is_charging()
     next_start = await _mower.mower_next_start_time()
+    # In planner mode the firmware scheduler only holds a dummy placeholder,
+    # so next_start_time must come from the planner's planned sessions.
+    _planner_cfg = planner_load_config()
+    _planner_active = bool(_planner_cfg.get("enabled"))
+    if _planner_active:
+        _next_planned = planner.get_next_planned_session()
+        # If mower is currently charging mid-session, prefer the charge-based
+        # estimate (shown as estimated_next_start_time) over the session start
+        # time (which is already in the past).
+        if planner._active_session:
+            next_start = None
+        elif _next_planned:
+            next_start = _next_planned["start_dt"]
+        else:
+            next_start = None
     mower_name = await _mower.command("GetUserMowerNameAsAsciiString")
     serial = await _mower.command("GetSerialNumber")
     manufacturer = await _mower.get_manufacturer()
     model = await _mower.get_model()
+    supports_cutting_height = await _mower.get_supports_cutting_height()
     error_code = await _mower.command("GetError")
     mode = await _mower.mower_mode()
     restriction_raw = await _mower.command("GetRestrictionReason")
@@ -907,6 +928,41 @@ async def get_status():
         if restriction_raw is not None else None
     )
 
+    # ── Control mode & smart context ─────────────────────────────────────────
+    control_mode = "smart" if _planner_active else "classic"
+    smart_context: Optional[str] = None
+    if _planner_active:
+        if planner._user_inhibited:
+            _next_planned = planner.get_next_planned_session()
+            _when = (
+                _next_planned["start_dt"].strftime("%a %-d %b at %H:%M")
+                if _next_planned else "no sessions planned"
+            )
+            smart_context = f"Parked by user — next session ({_when}) will be skipped until you Resume"
+        elif planner._active_session:
+            end_dt = (
+                planner._active_session["start_dt"]
+                + dt.timedelta(seconds=planner._active_session["duration_sec"])
+            )
+            mins_left = max(0, int((end_dt - dt.datetime.now()).total_seconds() / 60))
+            if activity == MowerActivity.CHARGING:
+                if remaining_charging_min is not None:
+                    resume_dt = dt.datetime.now() + dt.timedelta(minutes=remaining_charging_min)
+                    smart_context = f"Charging break — continues ~{resume_dt.strftime('%H:%M')}"
+                else:
+                    smart_context = f"Charging break — session ends {end_dt.strftime('%H:%M')}"
+            else:
+                smart_context = f"Active — ends {end_dt.strftime('%H:%M')} ({mins_left} min left)"
+        elif _next_planned:
+            start = _next_planned["start_dt"]
+            smart_context = (
+                f"Next: {_next_planned['dow_name']} {start.strftime('%-d %b')}"
+                f" at {start.strftime('%H:%M')}"
+                f" ({_next_planned['duration_sec'] // 60} min)"
+            )
+        else:
+            smart_context = "No sessions planned — run planner"
+
     return {
         "connected": True,
         "address": _mower.address,
@@ -914,11 +970,15 @@ async def get_status():
         "serial_number": serial,
         "manufacturer": manufacturer,
         "model": model,
+        "supports_cutting_height": supports_cutting_height,
         "state": state.name if state is not None else None,
         "state_description": _state_description(state),
         "activity": activity.name if activity is not None else None,
         "activity_description": _activity_description(activity),
         "mode": mode_name,
+        "control_mode": control_mode,
+        "smart_context": smart_context,
+        "user_inhibited": planner._user_inhibited if _planner_active else False,
         "restriction_reason": restriction_reason,
         "battery_level": battery,
         "charging": charging,
@@ -1196,59 +1256,236 @@ async def clear_runtime_samples():
 # ─── Commands ─────────────────────────────────────────────────────────────────
 @app.post("/api/command/mow")
 async def command_mow(req: MowRequest):
-    """Force the mower to mow for the given duration (hours)."""
+    """Force the mower to mow for the given duration (hours).
+
+    Smart mode: clears _user_inhibited and replaces any active executor session
+                with a synthetic one matching the requested duration.  This prevents
+                the executor from parking at the old session end time and ensures
+                it parks at the correct time when the manual override expires.
+                After the session the executor resumes normal planned-session dispatch.
+    Classic mode: raw SetOverrideMow — firmware parks when the override expires.
+    """
     _require_connection()
     if req.duration_hours <= 0:
         raise HTTPException(422, "duration_hours must be > 0")
-    logger.info("CMD mow: duration=%.1f h  mower=%s", req.duration_hours, _mower.address)
+    _cfg = planner_load_config()
+    _smart = bool(_cfg.get("enabled"))
+    logger.info("CMD mow: duration=%.1f h  mode=%s  mower=%s",
+                req.duration_hours, "smart" if _smart else "classic", _mower.address)
+    if _smart:
+        planner._user_inhibited = False
+        # Replace any existing active session with a synthetic one so the executor
+        # parks at the right time (end of this manual override) and not sooner.
+        _now = dt.datetime.now()
+        planner._active_session = {
+            "date": str(_now.date()),
+            "dow_name": "Manual",
+            "start_dt": _now,
+            "duration_sec": int(req.duration_hours * 3600),
+        }
+        logger.info("CMD mow: cleared inhibit, set synthetic active session for %.1f h", req.duration_hours)
     await _mower.mower_override(req.duration_hours)
-    return {"status": "ok", "action": "mow", "duration_hours": req.duration_hours}
+    msg = (
+        f"Mowing for {req.duration_hours:.4g} h — executor will park when done and then resume planned sessions."
+        if _smart else
+        f"Mowing for {req.duration_hours:.4g} h."
+    )
+    return {"status": "ok", "action": "mow",
+            "control_mode": "smart" if _smart else "classic",
+            "duration_hours": req.duration_hours, "message": msg}
 
 
 @app.post("/api/command/pause")
 async def command_pause():
-    """Pause the mower."""
+    """Pause the mower.
+
+    Smart mode: also sets _user_inhibited so the executor does not restart the
+                mower at the next planned session. Use Resume to clear.
+    Classic mode: raw Pause command only.
+    """
     _require_connection()
-    logger.info("CMD pause  mower=%s", _mower.address)
+    _cfg = planner_load_config()
+    _smart = bool(_cfg.get("enabled"))
+    logger.info("CMD pause  mode=%s  mower=%s", "smart" if _smart else "classic", _mower.address)
+    if _smart:
+        planner._user_inhibited = True
+        logger.info("CMD pause: set user inhibit — executor will skip sessions until resumed")
     await _mower.mower_pause()
-    return {"status": "ok", "action": "pause"}
+    msg = (
+        "Paused — executor inhibited. Use Resume to let the planner take over again."
+        if _smart else
+        "Mower paused."
+    )
+    return {"status": "ok", "action": "pause", "control_mode": "smart" if _smart else "classic", "message": msg}
 
 
 @app.post("/api/command/resume")
 async def command_resume():
-    """Resume the mower (continues according to schedule)."""
+    """Resume the mower.
+
+    Classic mode: ClearOverride + AUTO + StartTrigger — follows firmware schedule.
+
+    Smart mode — two sub-cases:
+      a) Active session still running (now < session end): re-issues
+         mower_override_seconds(remaining_sec) so the executor's mowing window
+         is restored without touching ClearOverride.  ClearOverride would cancel
+         the SetOverrideMow the executor issued and the mower would stop.
+      b) No active session (between sessions or paused independently): falls back
+         to mower_resume() which is safe — ClearOverride has nothing important to
+         clear and the executor will start the next session on schedule.
+    """
     _require_connection()
+    _cfg = planner_load_config()
+    _smart = bool(_cfg.get("enabled"))
+    logger.info("CMD resume  mode=%s  mower=%s", "smart" if _smart else "classic", _mower.address)
+
+    if _smart:
+        planner._user_inhibited = False
+        logger.info("CMD resume: cleared user inhibit")
+
+    if _smart and planner._active_session:
+        sess = planner._active_session
+        # If this is a manual mow session (set by command_mow), Resume means
+        # "hand control back to the planner" — clear it and fall through to
+        # mower_resume() so the executor picks up the next planned session.
+        if sess.get("dow_name") == "Manual":
+            planner._active_session = None
+            logger.info("CMD resume: cleared manual mow session, handing back to planner")
+        else:
+            end_dt = sess["start_dt"] + dt.timedelta(seconds=sess["duration_sec"])
+            remaining_sec = int((end_dt - dt.datetime.now()).total_seconds())
+            if remaining_sec > 0:
+                logger.info(
+                    "CMD resume: active session, re-issuing override for %ds remaining (ends %s)",
+                    remaining_sec, end_dt.strftime("%H:%M"),
+                )
+                await _mower.mower_override_seconds(remaining_sec)
+                msg = (
+                    f"Resumed active session — mowing until {end_dt.strftime('%H:%M')} "
+                    f"({remaining_sec // 60} min remaining)."
+                )
+                return {"status": "ok", "action": "resume_active_session",
+                        "control_mode": "smart", "message": msg}
+            # Session window just expired — fall through to normal resume
+
     await _mower.mower_resume()
-    return {"status": "ok", "action": "resume"}
+    msg = (
+        "Resumed — mower will follow the planner's next scheduled session."
+        if _smart else
+        "Resumed — mower will follow its firmware weekly schedule."
+    )
+    return {"status": "ok", "action": "resume", "control_mode": "smart" if _smart else "classic", "message": msg}
 
 
 @app.post("/api/command/park")
 async def command_park():
-    """Park the mower until the next scheduled start."""
+    """Skip the current session and send the mower home.
+
+    Classic mode: SetOverrideParkUntilNextStart — parks until the firmware's
+                  own next weekly task.
+    Smart mode:   Only acts when a session is currently active. Cancels that
+                  session and sends the mower home. The executor will dispatch
+                  the next planned session normally — no inhibit is set.
+                  If no session is active, returns a no-op message.
+    """
     _require_connection()
-    await _mower.mower_park()
-    return {"status": "ok", "action": "park_until_next_start"}
+    _cfg = planner_load_config()
+    _smart = bool(_cfg.get("enabled"))
+    logger.info("CMD park  mode=%s  mower=%s", "smart" if _smart else "classic", _mower.address)
+    if _smart:
+        if planner._active_session:
+            _cancelled = planner._active_session
+            planner._active_session = None  # executor won't act on this session any more
+            await _mower.mower_park_home()
+            _next = planner.get_next_planned_session()
+            _when = (
+                _next["start_dt"].strftime("%a %-d %b at %H:%M")
+                if _next else "no further sessions planned"
+            )
+            msg = (
+                f"Session cancelled — mower sent home. "
+                f"Next planned session: {_when}."
+            )
+            logger.info("CMD park: cancelled active session %s, next=%s",
+                        _cancelled["date"], _when)
+            return {"status": "ok", "action": "session_cancelled",
+                    "control_mode": "smart", "message": msg}
+        else:
+            return {"status": "ok", "action": "no_active_session",
+                    "control_mode": "smart",
+                    "message": "No active session — mower is already between sessions."}
+    else:
+        await _mower.mower_park()
+        return {"status": "ok", "action": "park_until_next_start", "control_mode": "classic",
+                "message": "Parked — will resume at next firmware scheduled start."}
 
 
 @app.post("/api/command/park_home")
 async def command_park_home():
     """
     Park the mower until further notice (HOME mode).
-    The mower ignores the week schedule and cannot be force-started.
+
+    Smart mode: also sets _user_inhibited so the executor does not start any
+                future planned sessions. Use Resume to clear.
+    Both modes: mower is sent home and will not mow again until manually resumed.
     """
     _require_connection()
+    _cfg = planner_load_config()
+    _smart = bool(_cfg.get("enabled"))
+    logger.info("CMD park_home  mode=%s  mower=%s", "smart" if _smart else "classic", _mower.address)
+    if _smart:
+        planner._user_inhibited = True
+        planner._active_session = None  # cancel any in-progress session tracking
+        logger.info("CMD park_home: set user inhibit + cleared active session")
     await _mower.mower_park_home()
-    return {"status": "ok", "action": "park_until_further_notice"}
+    msg = (
+        "Parked until further notice — executor inhibited. Use Resume to let the planner take over again."
+        if _smart else
+        "Parked until further notice."
+    )
+    return {"status": "ok", "action": "park_until_further_notice",
+            "control_mode": "smart" if _smart else "classic", "message": msg}
 
 
 @app.post("/api/command/park_duration")
 async def command_park_duration(req: ParkDurationRequest):
-    """Park the mower for the specified duration (hours), then resume normal schedule."""
+    """Park the mower for the specified duration (hours), then resume normal schedule.
+
+    Smart mode: sets _user_inhibited to block the executor during the park window,
+                then schedules a background task to clear it after the duration so
+                the executor resumes dispatching planned sessions automatically.
+    Classic mode: raw SetOverridePark — firmware resumes its own schedule after expiry.
+    """
     _require_connection()
     if req.duration_hours <= 0:
         raise HTTPException(422, "duration_hours must be > 0")
+    _cfg = planner_load_config()
+    _smart = bool(_cfg.get("enabled"))
+    logger.info("CMD park_duration  mode=%s  h=%.2f  mower=%s",
+                "smart" if _smart else "classic", req.duration_hours, _mower.address)
+    if _smart:
+        planner._user_inhibited = True
+        duration_sec = req.duration_hours * 3600
+
+        async def _auto_clear_inhibit():
+            await asyncio.sleep(duration_sec)
+            if planner._user_inhibited:
+                planner._user_inhibited = False
+                logger.info("CMD park_duration: auto-cleared user inhibit after %.0f s", duration_sec)
+
+        asyncio.create_task(_auto_clear_inhibit())
+        logger.info("CMD park_duration: set user inhibit, will auto-clear in %.0f s", duration_sec)
+
     await _mower.mower_park_duration(req.duration_hours)
-    return {"status": "ok", "action": "park_duration", "duration_hours": req.duration_hours}
+    msg = (
+        f"Parked for {req.duration_hours:.4g} h — executor inhibited. "
+        f"Planner will resume automatically after the park window expires."
+        if _smart else
+        f"Parked for {req.duration_hours:.4g} h — firmware will resume its schedule afterwards."
+    )
+    return {"status": "ok", "action": "park_duration",
+            "control_mode": "smart" if _smart else "classic",
+            "duration_hours": req.duration_hours, "message": msg}
 
 
 # ─── Schedule ─────────────────────────────────────────────────────────────────
@@ -1287,9 +1524,15 @@ async def get_schedule():
 async def set_schedule(schedule: ScheduleRequest):
     """
     Replace the entire mowing schedule.
-    Sends: StartTaskTransaction → DeleteAllTask → AddTask×N → CommitTaskTransaction.
+    Blocked when the planner is active (the planner owns the scheduler).
     """
     _require_connection()
+    _s_cfg = planner_load_config()
+    if _s_cfg.get("enabled"):
+        raise HTTPException(
+            409,
+            "Schedule is managed by the planner — disable the planner first.",
+        )
 
     from automower_ble.protocol import TaskInformation
 
@@ -1421,6 +1664,7 @@ class PlannerConfigRequest(BaseModel):
     rain_delay_minutes: int = 0
     watchdog_enabled: bool = False
     watchdog_interval_minutes: int = 5
+    watchdog_dry_delay_minutes: int = 0
     hedgehog_protection: bool = False
     heat_stress_protection: bool = False
     heat_stress_temp_celsius: float = 28.0
@@ -1483,6 +1727,29 @@ async def get_planner_status():
         "last_log": planner.last_log,
         "replan_interval_hours": cfg.get("replan_interval_hours", 6.0),
         "replan_time": cfg.get("replan_time", ""),
+        "next_run": planner.next_run_dt.isoformat() if planner.next_run_dt else None,
+        "active_session": (
+            {
+                "date": planner._active_session["date"],
+                "start_time": planner._active_session["start_dt"].strftime("%H:%M"),
+                "end_time": (
+                    planner._active_session["start_dt"]
+                    + dt.timedelta(seconds=planner._active_session["duration_sec"])
+                ).strftime("%H:%M"),
+                "duration_minutes": planner._active_session["duration_sec"] // 60,
+            }
+            if planner._active_session else None
+        ),
+        "planned_sessions": [
+            {
+                "date": s["date"],
+                "dow_name": s["dow_name"],
+                "start_time": s["start_dt"].strftime("%H:%M"),
+                "duration_minutes": s["duration_sec"] // 60,
+                "start_dt": s["start_dt"].isoformat(),
+            }
+            for s in planner._planned_sessions
+        ],
     }
 
 
@@ -1490,6 +1757,24 @@ async def get_planner_status():
 async def get_planner_forecast():
     """Return the last fetched weather forecast and daily sunrise/sunset data."""
     return {"forecast": planner.last_forecast, "daily": planner.last_daily}
+
+
+@app.get("/api/mow_history")
+async def get_mow_history():
+    """Return the full mow history (up to 90 days)."""
+    history = load_mow_history()
+    # Sort descending by date so newest entries come first
+    entries = [
+        {
+            "date": date,
+            "mow_sec": v.get("mow_sec", 0),
+            "mow_min": round(v.get("mow_sec", 0) / 60),
+            "complete": v.get("complete", False),
+            "last_updated": v.get("last_updated"),
+        }
+        for date, v in sorted(history.items(), reverse=True)
+    ]
+    return {"entries": entries}
 
 
 @app.get("/api/planner/geocode")
@@ -1511,6 +1796,7 @@ async def get_watchdog_status():
     return {
         "enabled": cfg.get("watchdog_enabled", False),
         "interval_minutes": cfg.get("watchdog_interval_minutes", 5),
+        "dry_delay_minutes": cfg.get("watchdog_dry_delay_minutes", 0),
         "running": watchdog.is_running(),
         "parked_by_watchdog": watchdog._parked_by_watchdog,
         "last_check": watchdog.last_check,

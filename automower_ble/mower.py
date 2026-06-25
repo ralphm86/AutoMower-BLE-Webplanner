@@ -131,6 +131,18 @@ class Mower(BLEClient):
 
         return model_information.model
 
+    async def get_supports_cutting_height(self) -> bool:
+        """Return True if the mower model supports remote cutting height control."""
+        model = await self.command("GetModel")
+        if model is None:
+            return True  # unknown model — assume supported
+        model_information = MowerModels.get(
+            (model["deviceType"], model["deviceVariant"])
+        )
+        if model_information is None:
+            return True  # unknown model — assume supported
+        return model_information.supports_cutting_height
+
     async def is_charging(self) -> bool:
         """Get the mower charging status"""
         return bool(await self.command("IsCharging"))
@@ -171,21 +183,29 @@ class Mower(BLEClient):
             return None
         return ModeOfOperation(mode)
 
-    async def mower_override(self, duration_hours: float = 3.0) -> None:
+    async def mower_override_seconds(self, duration_seconds: int) -> None:
         """
-        Force the mower to run for the specified duration in hours.
+        Force the mower to run for the specified duration in seconds.
         """
-        if duration_hours <= 0:
+        if duration_seconds <= 0:
             raise ValueError("Duration must be greater than 0")
 
         # Set mode of operation to auto:
         await self.command("SetMode", mode=ModeOfOperation.AUTO)
 
         # Set the duration of operation:
-        await self.command("SetOverrideMow", duration=int(duration_hours * 3600))
+        await self.command("SetOverrideMow", duration=duration_seconds)
 
         # Request trigger to start, the response validation is expected to fail
         await self.command("StartTrigger")
+
+    async def mower_override(self, duration_hours: float = 3.0) -> None:
+        """
+        Force the mower to run for the specified duration in hours.
+        """
+        if duration_hours <= 0:
+            raise ValueError("Duration must be greater than 0")
+        await self.mower_override_seconds(int(duration_hours * 3600))
 
     async def mower_pause(self):
         await self.command("Pause")

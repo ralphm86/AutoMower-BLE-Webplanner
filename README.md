@@ -18,17 +18,17 @@ Details on the reverse-engineering process: https://www.alistair23.me/2024/01/06
 │                                                         │
 │  Browser  ──HTTP──►  web_app.py  (FastAPI / uvicorn)   │
 │                           │                             │
-│                    ┌──────┴──────┐                      │
-│                    │             │                      │
-│               planner.py    automower_ble/              │
-│           (Weather Agent)    mower.py                   │
-│                    │         protocol.py                │
-│                    │         protocol.json              │
-│             Open-Meteo API       │                      │
-│             (forecast +          │                      │
-│              current wx)    BLE (bleak)                 │
-│                                  │                      │
-│                           Husqvarna Automower           │
+│        ┌──────────────────┼──────────────────┐          │
+│        │                  │                  │          │
+│   planner.py         automower_ble/    background loops │
+│  PlannerAgent +       mower.py         (reconnect /     │
+│  WeatherWatchdog      protocol.py       sampler /       │
+│        │              protocol.json     idle-sleep)     │
+│        │                  │                  │          │
+│  Open-Meteo API       BLE (bleak) ◄──────────┘          │
+│  (forecast +              │                             │
+│   current wx)             │                             │
+│                    Husqvarna Automower                  │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -39,22 +39,47 @@ Details on the reverse-engineering process: https://www.alistair23.me/2024/01/06
 | `automower_ble/protocol.json` | Reverse-engineered BLE command definitions (major/minor IDs, request & response field types) |
 | `automower_ble/protocol.py` | Low-level BLE client: packet encoding/decoding, CRC, connection handshake |
 | `automower_ble/mower.py` | High-level mower API: `connect`, `set_schedule`, `mower_park`, `set_time`, etc. |
-| `web_app.py` | FastAPI web server — REST API + HTML page serving. Manages connection state, auto-reconnect, time sync |
+| `automower_ble/models.py` | Mapping of `(deviceType, deviceVariant)` codes to human-readable model names |
+| `automower_ble/error_codes.py` | Enumeration of mower error / message codes |
+| `automower_ble/helpers.py` | Shared encoding/CRC helpers |
+| `web_app.py` | FastAPI web server — REST API + HTML page serving. Manages connection state, auto-reconnect, BLE idle sleep, time sync, runtime sampling |
 | `planner.py` | Weather-based planning agent (`PlannerAgent`) and real-time watchdog (`WeatherWatchdog`) |
 | `templates/index.html` | Single-page Bootstrap 5 UI (7 tabs: Connect, Status, Commands, Schedule, Statistics, Messages, Planner) |
-| `planner_config.json` | Persisted planner settings (location, windows, thresholds, watchdog) |
+| `templates/login.html` | Password login page (shown when authentication is enabled) |
+| `ble_scanner.py` | Standalone CLI scanner that lists nearby Husqvarna BLE devices |
+| `mower_test_cli.py` | Interactive CLI for exercising mower commands without the web app |
+| `tests/` | `pytest` suite — BLE protocol, web API, planner logic, weather-watchdog coordination, and Playwright UI tests |
+| `planner_config.json` | Persisted planner settings (location, windows, thresholds, protections, watchdog) |
 | `reconnect_config.json` | Persisted BLE address, channel ID, PIN, and auto-reconnect flag |
+| `runtime_samples.json` | Rolling battery/activity samples used by the runtime estimator |
+| `mow_history.json` | Actual recorded mowing time per day (seeds the planner's interval constraint) |
+| `planned_sessions.json` | Upcoming planned mowing sessions dispatched by the planner's executor |
+| `plan_log.json` | Per-day decision log from the last planning run (shown in the Planner tab) |
 
 ### Key Features
 
 - **BLE pairing & control** — scan, connect, pair (with optional PIN), send all standard commands
-- **Schedule editor** — read the current 7-day schedule, edit it visually, push it back to the mower
-- **Auto-reconnect** — background loop re-connects automatically after a dropout
+- **Smart vs Classic control mode** — when the planner is enabled the app runs in **Smart** mode (commands cooperate with the planner's executor and session tracking); otherwise **Classic** mode issues raw firmware commands. See [Control Modes](#control-modes) below.
+- **Schedule editor** — read the current 7-day schedule, edit it visually, push it back to the mower (locked while the planner owns the schedule)
+- **Auto-reconnect** — background loop re-connects automatically after a dropout, recovering from BlueZ "zombie" links
+- **BLE idle sleep** — disconnects automatically when the web UI is idle and the mower is parked, then reconnects on the next request or upcoming planned session, to save energy
 - **Clock sync** — mower clock synced to local time on every connect
-- **Weather planner** — fetches hourly forecasts from [Open-Meteo](https://open-meteo.com) (free, no API key), computes optimal mowing slots respecting rain, wind, temperature, and rain-delay constraints, pushes the schedule to the mower
-- **Weather watchdog** — polls *current* conditions every N minutes; parks the mower (HOME mode) if a thunderstorm or threshold breach is detected mid-session, resumes automatically when conditions clear
+- **Weather planner** — fetches hourly forecasts from [Open-Meteo](https://open-meteo.com) (free, no API key) and computes optimal mowing slots respecting:
+  - per-day-of-week available time windows and target mowing hours
+  - minimum interval between mowing days
+  - per-session min/max duration
+  - rain, wind speed, temperature, and post-rain delay thresholds
+  - **hedgehog protection** (daylight-only mowing, sunrise→sunset)
+  - **heat-stress protection** (midday no-mow window + reduced frequency on hot days)
+  - **dew avoidance** (delay start until dew has evaporated, auto-estimated or fixed)
+  - **cycle-aware sizing** (inflates the window so actual cutting time hits the target despite charging breaks)
+- **Planner executor** — dispatches the computed sessions to the mower at the right time via direct override commands, deducting already-completed mowing from the daily target
+- **City geocoding** — resolve a city name to coordinates via Open-Meteo for the planner location
+- **Weather watchdog** — polls *current* conditions every N minutes; parks the mower (HOME mode) if a thunderstorm or threshold breach is detected mid-session, resumes automatically when conditions clear. An optional **drying delay** holds the resume for a configurable time after the weather clears so the lawn can dry; if that delay outlasts the interrupted session's window, the planner replans a make-up session (today if a window still allows it, otherwise the next valid day)
 - **Runtime estimator** — samples battery level and activity every minute; derives discharge/charge rates and estimates mowing vs charging breakdown for a planned session
+- **Mow history** — records actual mowing time per day so the planner's interval logic reflects reality even after missed or weather-cancelled sessions
 - **Password authentication** — optional session-cookie login page (bcrypt + signed cookie); enabled with `--password` or the `AUTH_PASSWORD` env var
+- **Rotating file logging** — optional `--log-file` with size-based rotation for multi-day diagnostics
 - **Flash wear protection** — schedule is only written to the mower when it actually changes
 - **Auto-load on tab switch** — each tab automatically fetches fresh data when opened (while connected)
 
@@ -184,6 +209,23 @@ The web UI can be protected with a single password. When enabled, all routes (ex
 
 ---
 
+## Control Modes
+
+The app behaves differently depending on whether the **planner** is enabled (toggle in the Planner tab).
+
+| | **Classic mode** (planner disabled) | **Smart mode** (planner enabled) |
+|---|---|---|
+| Schedule | Firmware weekly schedule, editable in the Schedule tab | Owned by the planner; the firmware holds a harmless placeholder task and the Schedule editor is locked |
+| Mowing | Mower follows its own weekly calendar | The planner's executor dispatches computed sessions via direct override commands |
+| Manual **Mow** | Raw `SetOverrideMow` for the chosen duration | Clears any user-park, installs a synthetic session so the executor parks at the right time, then resumes planned sessions |
+| **Pause / Park&nbsp;Home** | Raw firmware command | Also sets a *user inhibit* so the executor skips upcoming sessions until you **Resume** |
+| **Resume** | `ClearOverride` + AUTO + start | Clears the inhibit and restores the active session window without cancelling the executor's override |
+| **Park** (skip session) | Park until next firmware start | Cancels the current session only; the next planned session runs normally |
+
+In Smart mode the **Status** tab shows a *control context* line (e.g. "Active — ends 18:30", "Charging break — continues ~17:05", or "Parked by user — next session will be skipped").
+
+---
+
 ## Runtime Estimator
 
 The **Statistics** tab includes a runtime estimator that learns from observed battery samples:
@@ -210,6 +252,18 @@ Both files are created automatically on first use and are reloaded at runtime wi
 
 **`planner_config.json`** — Planner & watchdog settings (edit via the Planner tab in the UI).
 
+### Runtime state files
+
+These are written automatically while the server runs and need no manual editing:
+
+| File | Contents |
+|---|---|
+| `runtime_samples.json` | Rolling battery/activity samples for the runtime estimator |
+| `mow_history.json` | Actual mowing seconds per day (pruned to 90 days) |
+| `planned_sessions.json` | Upcoming planned sessions awaiting dispatch |
+| `plan_log.json` | Per-day decision log from the last planning run |
+
+
 ---
 
 ## CLI / Library Usage
@@ -221,12 +275,36 @@ python ble_scanner.py
 
 Direct mower control (without the web app):
 ```bash
-python automower_ble/mower.py --address D8:B6:73:40:07:37
+python -m automower_ble.mower --address D8:B6:73:40:07:37
 # with a command:
-python automower_ble/mower.py --address D8:B6:73:40:07:37 --command park
+python -m automower_ble.mower --address D8:B6:73:40:07:37 --command park
+# with a PIN (experimental):
+python -m automower_ble.mower --address D8:B6:73:40:07:37 --pin 1234
 ```
 
 Available commands: `park`, `pause`, `override`, `resume`
+
+An interactive testing CLI is also provided:
+```bash
+python mower_test_cli.py
+```
+
+### Web server options
+
+```bash
+python web_app.py [options]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--host` | `127.0.0.1` | Interface to bind |
+| `--port` | `8080` | Port to listen on |
+| `--log-level` | `info` | `debug` / `info` / `warning` / `error` |
+| `--password` | _(none)_ | Web UI password (or `AUTH_PASSWORD` env var); auth disabled if omitted |
+| `--secret-key` | random | Session-cookie signing secret (or `SECRET_KEY` env var); set for stable sessions across restarts |
+| `--log-file` | _(none)_ | Also write logs to this rotating file |
+| `--log-max-mb` | `10` | Max size (MB) before the log file rotates |
+| `--log-backups` | `5` | Number of rotated log files to keep |
 
 ---
 
@@ -234,9 +312,49 @@ Available commands: `park`, `pause`, `override`, `resume`
 
 ### Running Tests
 
+The BLE protocol tests run with no extra dependencies:
+
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+The full suite (protocol + web API + planner + watchdog) uses `pytest`. Install
+the test extras and run:
+
+```bash
+pip install -e ".[test]"
+pytest                      # protocol, web API, planner and watchdog tests
+```
+
+The web-API, planner and watchdog tests need no Bluetooth hardware — the BLE
+`Mower` is replaced with a mock and the FastAPI app is driven in-process.
+
+The watchdog tests (`tests/test_watchdog.py`) specifically cover how the
+`WeatherWatchdog` coordinates with the planner's session executor: parking on
+bad weather, schedule-aware resume (re-issuing the override for an active
+session instead of clearing it), not starting unplanned mowing once a session
+window has ended, respecting a user park, and the drying delay (holding the
+resume until the lawn has dried, then either resuming or replanning a make-up
+session if the session window has passed).
+
+#### Browser / UI tests (optional)
+
+The HTML layer is covered by Playwright tests that run the real page in a
+headless browser. They are excluded from the default run; enable them with:
+
+```bash
+pip install -e ".[test,ui]"
+playwright install chromium
+pytest tests/test_ui_playwright.py
+```
+
+> **Run the Playwright tests separately.** `pytest-playwright` keeps an event
+> loop running in the main thread after its first test, which breaks any
+> `async` unit test that runs afterwards in the same process
+> (`RuntimeError: Runner.run() cannot be called from a running event loop`).
+> For this reason the UI file is excluded from the default `pytest` run via
+> `addopts` in `pyproject.toml`. Use `pytest` for everything else and
+> `pytest tests/test_ui_playwright.py` for the UI layer.
 
 ### Command Protocol
 

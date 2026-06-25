@@ -21,6 +21,30 @@ dependencies = [
   "bleak_retry_connector",
 ]
 
+[project.optional-dependencies]
+# Install with:  pip install -e ".[test]"
+test = [
+  "pytest",
+  "pytest-asyncio",
+  "httpx",                 # FastAPI TestClient transport
+  "fastapi",
+  "uvicorn",
+  "bcrypt",
+  "itsdangerous",
+  "jinja2",
+  "python-multipart",      # FastAPI form parsing for /login
+]
+# UI / browser tests (Playwright). After install run: playwright install chromium
+ui = [
+  "pytest-playwright",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# UI tests need a live server + browser; exclude them from the default run.
+addopts = "--ignore=tests/test_ui_playwright.py"
+
 [tool.ruff]
 required-version = ">=0.4.2"
 

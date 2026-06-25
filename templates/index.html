@@ -157,44 +157,60 @@
 
   <!-- ── COMMANDS ─────────────────────────────────────────────────────────── -->
   <div id="sec-commands" class="section">
+
+    <!-- Context bar: refreshed by loadCommands() -->
+    <div id="cmd-context-bar" class="alert py-2 mb-3 d-flex align-items-center gap-2 alert-secondary">
+      <span class="text-muted small">Connect to a mower and refresh to see control mode.</span>
+    </div>
+
     <div class="row g-4">
 
+      <!-- Mow / Override -->
       <div class="col-12 col-md-6">
-        <div class="card">
-          <div class="card-header bg-success text-white"><i class="bi bi-play-circle me-2"></i>Mowing</div>
+        <div class="card h-100">
+          <div class="card-header bg-success text-white"><i class="bi bi-scissors me-2"></i>Mow</div>
           <div class="card-body d-flex flex-column gap-3">
-
             <div>
               <label class="form-label fw-semibold">Force Mow</label>
               <div class="input-group">
                 <input id="mow-hours" type="number" class="form-control" value="3" min="0.5" max="24" step="0.5" />
                 <span class="input-group-text">hours</span>
                 <button class="btn btn-success cmd-btn" onclick="sendCommand('mow')">
-                  <i class="bi bi-scissors me-1"></i>Start Mowing
+                  <i class="bi bi-play-fill me-1"></i>Start Mowing
                 </button>
               </div>
+              <div class="form-text">Immediately starts the mower for the given duration, regardless of schedule or planner.</div>
             </div>
 
-            <button class="btn btn-outline-primary cmd-btn" onclick="sendCommand('resume')">
-              <i class="bi bi-play-fill me-1"></i>Resume Schedule
-            </button>
-
+            <div>
+              <button id="cmd-resume-btn" class="btn btn-outline-primary cmd-btn w-100" onclick="sendCommand('resume')">
+                <i class="bi bi-play-circle me-1"></i><span id="cmd-resume-label">Resume Schedule</span>
+              </button>
+              <div id="cmd-resume-note" class="form-text mt-1"></div>
+            </div>
           </div>
         </div>
       </div>
 
+      <!-- Park & Stop -->
       <div class="col-12 col-md-6">
-        <div class="card">
-          <div class="card-header bg-warning text-dark"><i class="bi bi-pause-circle me-2"></i>Parking &amp; Pausing</div>
+        <div class="card h-100">
+          <div class="card-header bg-warning text-dark"><i class="bi bi-house me-2"></i>Park &amp; Stop</div>
           <div class="card-body d-flex flex-column gap-3">
 
-            <button class="btn btn-outline-warning cmd-btn" onclick="sendCommand('pause')">
-              <i class="bi bi-pause-fill me-1"></i>Pause
-            </button>
+            <div>
+              <button class="btn btn-outline-warning cmd-btn w-100" onclick="sendCommand('pause')">
+                <i class="bi bi-pause-fill me-1"></i>Pause
+              </button>
+              <div id="cmd-pause-note" class="form-text mt-1"></div>
+            </div>
 
-            <button class="btn btn-warning cmd-btn" onclick="sendCommand('park')">
-              <i class="bi bi-house-fill me-1"></i>Park Until Next Start
-            </button>
+            <div>
+              <button id="cmd-park-btn" class="btn btn-warning cmd-btn w-100" onclick="sendCommand('park')">
+                <i class="bi bi-house-fill me-1"></i><span id="cmd-park-label">Park Until Next Start</span>
+              </button>
+              <div id="cmd-park-note" class="form-text mt-1"></div>
+            </div>
 
             <div>
               <label class="form-label fw-semibold">Park for Duration</label>
@@ -205,19 +221,24 @@
                   <i class="bi bi-hourglass-split me-1"></i>Park for Duration
                 </button>
               </div>
-              <div class="form-text">Parks the mower for the set time, then resumes the normal schedule automatically.</div>
+              <div class="form-text">Parks for the set time, then resumes automatically.</div>
+              <div id="cmd-park-duration-note" class="form-text mt-1"></div>
             </div>
 
-            <button class="btn btn-danger cmd-btn"
-                    onclick="confirmCmd('This will park the mower until you manually resume it (HOME mode). Continue?', 'park_home')">
-              <i class="bi bi-house-lock-fill me-1"></i>Park Until Further Notice
-            </button>
+            <div>
+              <button class="btn btn-danger cmd-btn w-100"
+                      onclick="confirmCmd('This will park the mower until you manually resume it (HOME mode). Continue?', 'park_home')">
+                <i class="bi bi-house-lock-fill me-1"></i>Park Until Further Notice
+              </button>
+              <div class="form-text">Emergency stop — overrides everything. Resume manually.</div>
+            </div>
 
           </div>
         </div>
       </div>
 
-      <div class="col-12 col-md-6">
+      <!-- Cutting Height (hidden for models that don't support it) -->
+      <div class="col-12 col-md-6" id="cutting-height-card">
         <div class="card">
           <div class="card-header bg-secondary text-white"><i class="bi bi-rulers me-2"></i>Cutting Height</div>
           <div class="card-body">
@@ -246,13 +267,19 @@
         <button class="btn btn-secondary btn-sm" onclick="_runTabLoader('sec-schedule')">
           <i class="bi bi-arrow-clockwise me-1"></i>Refresh
         </button>
-        <button class="btn btn-success btn-sm" onclick="addTaskRow()">
+        <button id="schedule-add-btn" class="btn btn-success btn-sm" onclick="addTaskRow()">
           <i class="bi bi-plus-circle me-1"></i>Add Task
         </button>
-        <button class="btn btn-primary btn-sm" onclick="saveSchedule()">
+        <button id="schedule-save-btn" class="btn btn-primary btn-sm" onclick="saveSchedule()">
           <i class="bi bi-cloud-upload me-1"></i>Save to Mower
         </button>
       </div>
+    </div>
+
+    <div id="schedule-planner-lock" class="alert alert-warning py-2 mb-3" style="display:none">
+      <i class="bi bi-lock-fill me-2"></i>
+      <strong>Planner is active.</strong> The schedule is managed automatically.
+      Disable the planner in the <strong>Planner</strong> tab to edit manually.
     </div>
 
     <div class="card">
@@ -595,6 +622,14 @@
                 <span class="input-group-text">min</span>
               </div>
             </div>
+            <div class="mb-2">
+              <label class="form-label fw-semibold">Drying Delay</label>
+              <div class="input-group">
+                <input id="pl-watchdog-dry-delay" type="number" class="form-control" value="0" min="0" max="240" step="1" />
+                <span class="input-group-text">min</span>
+              </div>
+              <div class="text-muted small">Wait this long after the weather clears before resuming, so the lawn can dry (0 = resume immediately). If the delay outlasts the session window, the planner replans a make-up session.</div>
+            </div>
 
           </div>
         </div>
@@ -651,11 +686,21 @@
         </div>
       </div>
 
-      <!-- Planning log -->
+      <!-- Planning log / Mow history (toggled) -->
       <div class="col-12 col-md-7">
         <div class="card">
-          <div class="card-header"><i class="bi bi-calendar-check me-2"></i>Planning Log — Next 7 Days</div>
-          <div class="card-body p-0">
+          <div class="card-header d-flex justify-content-between align-items-center">
+            <span id="log-panel-title"><i class="bi bi-calendar-check me-2"></i>Planning Log — Next 7 Days</span>
+            <div class="btn-group btn-group-sm" role="group" aria-label="Log view toggle">
+              <input type="radio" class="btn-check" name="log-view" id="log-view-plan" autocomplete="off" checked>
+              <label class="btn btn-outline-secondary" for="log-view-plan"><i class="bi bi-calendar-check me-1"></i>Plan</label>
+              <input type="radio" class="btn-check" name="log-view" id="log-view-history" autocomplete="off">
+              <label class="btn btn-outline-secondary" for="log-view-history"><i class="bi bi-clock-history me-1"></i>History</label>
+            </div>
+          </div>
+
+          <!-- Planning log panel -->
+          <div id="log-panel-plan" class="card-body p-0">
             <div class="table-responsive">
               <table class="table table-sm table-hover mb-0">
                 <thead class="table-light">
@@ -663,6 +708,20 @@
                 </thead>
                 <tbody id="planner-log-body">
                   <tr><td colspan="5" class="text-center text-muted py-3">Run the planner to see the log.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Mow history panel -->
+          <div id="log-panel-history" class="card-body p-0" style="display:none">
+            <div class="table-responsive">
+              <table class="table table-sm table-hover mb-0">
+                <thead class="table-light">
+                  <tr><th>Date</th><th>Day</th><th>Duration</th><th>Status</th></tr>
+                </thead>
+                <tbody id="mow-history-body">
+                  <tr><td colspan="4" class="text-center text-muted py-3">Loading…</td></tr>
                 </tbody>
               </table>
             </div>
@@ -722,7 +781,11 @@ let _plannerConfigLoaded = false;
 // Planner only auto-refreshes status+watchdog; config is user-edited.
 const _tabAutoLoaders = {
   'sec-status':   async () => { if (_isConnected) await loadStatus(); },
-  'sec-schedule': async () => { if (_isConnected) await loadSchedule(); },
+  'sec-commands': async () => { if (_isConnected) await loadCommands(); },
+  'sec-schedule': async () => {
+    if (_isConnected) await loadSchedule();
+    await _checkPlannerScheduleLock();
+  },
   'sec-stats':    async () => { if (_isConnected) await loadStats(); },
   'sec-messages': async () => { if (_isConnected) await loadMessages(); },
   'sec-planner':  async () => {
@@ -1009,6 +1072,12 @@ async function loadStatus() {
             <div class="card-header bg-light"><i class="bi bi-activity me-2"></i>Current Status</div>
             <div class="card-body">
               <dl class="row mb-0">
+                <dt class="col-sm-5">Control Mode</dt>
+                <dd class="col-sm-7">
+                  ${s.control_mode === 'smart'
+                    ? '<span class="badge bg-success fs-6 px-2 py-1">Smart 🌿</span>'
+                    : '<span class="badge bg-secondary fs-6 px-2 py-1">Classic</span>'}
+                </dd>
                 <dt class="col-sm-5">State</dt>
                 <dd class="col-sm-7">
                   <span class="badge bg-${stateColor} status-badge">${escHtml(s.state || '—')}</span>
@@ -1019,6 +1088,19 @@ async function loadStatus() {
                   <span class="fw-semibold">${escHtml(s.activity || '—')}</span>
                   <div class="text-muted small">${escHtml(s.activity_description || '')}</div>
                 </dd>
+                ${s.control_mode === 'smart' ? `
+                <dt class="col-sm-5">Session</dt>
+                <dd class="col-sm-7">
+                  ${s.smart_context
+                    ? (s.smart_context.startsWith('Active')
+                        ? `<span class="text-success fw-semibold"><i class="bi bi-scissors me-1"></i>${escHtml(s.smart_context)}</span>`
+                        : s.smart_context.startsWith('Charging break')
+                          ? `<span class="text-primary"><i class="bi bi-lightning-charge me-1"></i>${escHtml(s.smart_context)}</span>`
+                          : s.smart_context.startsWith('Next')
+                            ? `<span class="text-body"><i class="bi bi-calendar-event me-1"></i>${escHtml(s.smart_context)}</span>`
+                            : `<span class="text-muted">${escHtml(s.smart_context)}</span>`)
+                    : '<span class="text-muted">—</span>'}
+                </dd>` : `
                 <dt class="col-sm-5">Mode</dt>
                 <dd class="col-sm-7">
                   ${s.mode === 'AUTO'
@@ -1031,7 +1113,7 @@ async function loadStatus() {
                   ${s.mode != null && s.mode !== 'AUTO'
                     ? '<div class="text-warning small fw-semibold">⚠ Not AUTO — schedule may not run</div>'
                     : ''}
-                </dd>
+                </dd>`}
                 <dt class="col-sm-5">Restriction</dt>
                 <dd class="col-sm-7">${s.restriction_reason && s.restriction_reason !== 'None'
                   ? `<span class="text-warning fw-semibold">${escHtml(s.restriction_reason)}</span>`
@@ -1046,6 +1128,7 @@ async function loadStatus() {
                         : ''}`
                     : 'No'}
                 </dd>
+                ${s.control_mode !== 'smart' ? `
                 <dt class="col-sm-5">Next Start</dt>
                 <dd class="col-sm-7">
                   ${s.next_start_time
@@ -1053,9 +1136,10 @@ async function loadStatus() {
                     : s.estimated_next_start_time
                       ? `<span class="text-muted">~${fmtDateTime(s.estimated_next_start_time)} <small>(est. from charge time)</small></span>`
                       : '—'}
-                </dd>
+                </dd>` : ''}
+                ${s.supports_cutting_height !== false ? `
                 <dt class="col-sm-5">Cutting Height</dt>
-                <dd class="col-sm-7">${s.cutting_height_cm != null ? s.cutting_height_cm + ' cm' : '—'}</dd>
+                <dd class="col-sm-7">${s.cutting_height_cm != null ? s.cutting_height_cm + ' cm' : '—'}</dd>` : ''}
               </dl>
             </div>
           </div>
@@ -1091,12 +1175,74 @@ async function loadStatus() {
           </div>
         </div>
       </div>`;
+
+    // Show/hide cutting height based on model capability
+    const cutEl = document.getElementById('cutting-height-card');
+    if (cutEl) cutEl.style.display = s.supports_cutting_height === false ? 'none' : '';
   } catch (e) {
     el.innerHTML = `<div class="alert alert-danger">Failed to load status: ${escHtml(e.message)}</div>`;
   }
 }
 
 // ─── Commands ─────────────────────────────────────────────────────────────────
+async function loadCommands() {
+  try {
+    const s = await api('GET', '/api/status');
+    const smart = s.control_mode === 'smart';
+    const bar = document.getElementById('cmd-context-bar');
+
+    // Context bar
+    if (smart) {
+      const inhibited = s.user_inhibited === true;
+      const ctx = s.smart_context ? ` &mdash; <span class="text-body-secondary">${escHtml(s.smart_context)}</span>` : '';
+      bar.className = `alert py-2 mb-3 d-flex align-items-center gap-2 ${inhibited ? 'alert-warning' : 'alert-success'}`;
+      bar.innerHTML = `<span class="badge ${inhibited ? 'bg-warning text-dark' : 'bg-success'}">Smart 🌿</span><span>Planner is active${ctx}</span>`;
+    } else {
+      const next = s.next_start_time
+        ? ` &mdash; <span class="text-body-secondary">Next start: ${escHtml(fmtDateTime(s.next_start_time))}</span>`
+        : '';
+      bar.className = 'alert py-2 mb-3 d-flex align-items-center gap-2 alert-secondary';
+      bar.innerHTML = `<span class="badge bg-secondary">Classic</span><span>Firmware schedule${next}</span>`;
+    }
+
+    // Resume button label + note
+    document.getElementById('cmd-resume-label').textContent = smart ? 'Resume Planner' : 'Resume Schedule';
+    document.getElementById('cmd-resume-note').innerHTML = smart
+      ? (s.user_inhibited
+          ? 'Clears the manual park — the planner executor will resume dispatching sessions normally.'
+          : 'Returns the mower to AUTO mode. The planner executor will start the next planned session on time.')
+      : 'Clears any override and resumes the mower\'s firmware weekly schedule.';
+
+    // Pause note
+    const pauseNoteEl = document.getElementById('cmd-pause-note');
+    if (pauseNoteEl) {
+      pauseNoteEl.innerHTML = smart
+        ? 'Halts the mower and inhibits the executor. Use Resume to let the planner take over again.'
+        : 'Temporarily halts the mower.';
+    }
+
+    // Park button label + note
+    document.getElementById('cmd-park-label').textContent = smart ? 'Skip Current Session' : 'Park Until Next Start';
+    document.getElementById('cmd-park-note').innerHTML = smart
+      ? 'Cancels the active mowing session and sends the mower home. The planner will start the next planned session automatically. Has no effect if no session is currently active.'
+      : 'Parks the mower until the next task in its firmware weekly schedule.';
+
+    // Park for Duration note
+    const parkDurNoteEl = document.getElementById('cmd-park-duration-note');
+    if (parkDurNoteEl) {
+      parkDurNoteEl.innerHTML = smart
+        ? 'In Smart mode the executor is inhibited during the park window and automatically re-enabled when it expires.'
+        : '';
+    }
+
+    // Show/hide cutting height card
+    const cutEl = document.getElementById('cutting-height-card');
+    if (cutEl) cutEl.style.display = s.supports_cutting_height === false ? 'none' : '';
+  } catch (e) {
+    // Non-critical — context bar stays in default state if status fetch fails
+  }
+}
+
 async function sendCommand(cmd) {
   const el = document.getElementById('cmd-result');
   let body;
@@ -1109,8 +1255,11 @@ async function sendCommand(cmd) {
     showSpinner();
     const data = await api('POST', `/api/command/${cmd}`, body || null);
     hideSpinner();
-    el.innerHTML = `<div class="alert alert-success">✔ Command <strong>${escHtml(cmd)}</strong> sent successfully.</div>`;
+    const msg = data.message || `Command <strong>${escHtml(cmd)}</strong> sent successfully.`;
+    el.innerHTML = `<div class="alert alert-success">✔ ${msg}</div>`;
     toast('Command sent: ' + cmd);
+    // Refresh context bar so labels stay in sync after a park/resume
+    if (['resume', 'park', 'park_home', 'pause', 'park_duration'].includes(cmd)) await loadCommands();
   } catch (e) {
     hideSpinner();
     el.innerHTML = `<div class="alert alert-danger">Command failed: ${escHtml(e.message)}</div>`;
@@ -1206,6 +1355,19 @@ function checkEmptySchedule() {
   if (!tbody.querySelector('tr')) {
     tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted py-3">No tasks. Click <strong>Add Task</strong> to add one.</td></tr>';
   }
+}
+
+async function _checkPlannerScheduleLock() {
+  try {
+    const cfg = await api('GET', '/api/planner/config');
+    const locked = !!cfg.enabled;
+    const banner  = document.getElementById('schedule-planner-lock');
+    const saveBtn = document.getElementById('schedule-save-btn');
+    const addBtn  = document.getElementById('schedule-add-btn');
+    if (banner)  banner.style.display = locked ? '' : 'none';
+    if (saveBtn) saveBtn.disabled = locked;
+    if (addBtn)  addBtn.disabled  = locked;
+  } catch { /* ignore */ }
 }
 
 async function saveSchedule() {
@@ -1533,6 +1695,7 @@ async function loadPlannerConfig() {
     document.getElementById('pl-dew-hours').value = cfg.dew_avoidance_hours_after_sunrise ?? 2.0;
     document.getElementById('pl-watchdog').checked = !!cfg.watchdog_enabled;
     document.getElementById('pl-watchdog-interval').value = cfg.watchdog_interval_minutes ?? 5;
+    document.getElementById('pl-watchdog-dry-delay').value = cfg.watchdog_dry_delay_minutes ?? 0;
 
     // Populate windows table
     const tbody = document.getElementById('windows-body');
@@ -1663,6 +1826,7 @@ async function savePlannerConfig() {
     dew_avoidance_hours_after_sunrise: parseFloat(document.getElementById('pl-dew-hours').value) || 2.0,
     watchdog_enabled: document.getElementById('pl-watchdog').checked,
     watchdog_interval_minutes: parseInt(document.getElementById('pl-watchdog-interval').value) || 5,
+    watchdog_dry_delay_minutes: parseInt(document.getElementById('pl-watchdog-dry-delay').value) || 0,
     available_windows: windows,
   };
 
@@ -1709,16 +1873,46 @@ async function loadPlannerStatus() {
       ? `<span class="badge bg-info">Running</span>`
       : `<span class="badge bg-light text-dark border">Idle</span>`;
 
+    const activeHtml = data.active_session
+      ? `<dt class="col-sm-5">Active session</dt>
+         <dd class="col-sm-7">
+           <span class="badge bg-success me-1">Mowing now</span>
+           ${escHtml(data.active_session.date)} &nbsp;
+           ${escHtml(data.active_session.start_time)}–${escHtml(data.active_session.end_time)}
+           <span class="text-muted small">(${data.active_session.duration_minutes} min)</span>
+         </dd>`
+      : '';
+
+    const nextSession = (data.planned_sessions || []).find(s => {
+      const start = new Date(s.start_dt);
+      return start > new Date();
+    });
+    const nextHtml = nextSession
+      ? `<dt class="col-sm-5">Next session</dt>
+         <dd class="col-sm-7">
+           <strong>${escHtml(nextSession.dow_name)}</strong>
+           ${escHtml(nextSession.date)}
+           at <strong>${escHtml(nextSession.start_time)}</strong>
+           <span class="text-muted small">(${nextSession.duration_minutes} min)</span>
+         </dd>`
+      : (data.enabled
+          ? `<dt class="col-sm-5">Next session</dt><dd class="col-sm-7 text-muted">None planned — run planner to schedule.</dd>`
+          : '');
+
     el.innerHTML = `
       <dl class="row mb-2">
         <dt class="col-sm-5">Status</dt>
         <dd class="col-sm-7">${statusBadge} ${runBadge}</dd>
+        ${activeHtml}
+        ${nextHtml}
         <dt class="col-sm-5">Replan every</dt>
         <dd class="col-sm-7">${data.replan_interval_hours} h${data.replan_time ? ' &amp; daily at <strong>' + escHtml(data.replan_time) + '</strong>' : ''}</dd>
         <dt class="col-sm-5">Last run</dt>
         <dd class="col-sm-7">${data.last_run ? fmtDateTime(data.last_run) : '—'}</dd>
         <dt class="col-sm-5">Last result</dt>
         <dd class="col-sm-7">${escHtml(data.last_result || '—')}</dd>
+        <dt class="col-sm-5">Next planner run</dt>
+        <dd class="col-sm-7">${data.next_run ? fmtDateTime(data.next_run) : (data.running ? '<span class="text-muted">—</span>' : '<span class="text-muted">Not scheduled</span>')}</dd>
       </dl>`;
 
     // Planning log
@@ -1823,6 +2017,65 @@ function renderPlannerLog(logEntries) {
     </tr>`;
   }).join('');
 }
+
+// ── Mow history ───────────────────────────────────────────────────────────────
+const _DOW_NAMES = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+
+async function loadMowHistory() {
+  const tbody = document.getElementById('mow-history-body');
+  try {
+    const data = await api('GET', '/api/mow_history');
+    if (!data.entries || !data.entries.length) {
+      tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted py-3">No mowing history yet.</td></tr>';
+      return;
+    }
+    // Bar scale: max mow_min for the visible entries
+    const maxMin = Math.max(...data.entries.map(e => e.mow_min), 1);
+    tbody.innerHTML = data.entries.map(e => {
+      const dow = _DOW_NAMES[(new Date(e.date).getDay() + 6) % 7];
+      const h = Math.floor(e.mow_min / 60);
+      const m = e.mow_min % 60;
+      const durStr = h > 0 ? `${h}h ${m}m` : `${m} min`;
+      const pct = Math.round(e.mow_min / maxMin * 100);
+      const barCol = e.complete ? 'bg-success' : 'bg-warning';
+      const statusBadge = e.complete
+        ? '<span class="badge bg-success">Complete</span>'
+        : '<span class="badge bg-warning text-dark">Partial</span>';
+      return `<tr>
+        <td class="font-monospace small">${escHtml(e.date)}</td>
+        <td class="small">${dow}</td>
+        <td style="min-width:140px">
+          <div class="d-flex align-items-center gap-2">
+            <div class="flex-grow-1" style="height:10px;background:#e9ecef;border-radius:4px">
+              <div class="${barCol}" style="width:${pct}%;height:100%;border-radius:4px"></div>
+            </div>
+            <span class="small text-nowrap">${escHtml(durStr)}</span>
+          </div>
+        </td>
+        <td>${statusBadge}</td>
+      </tr>`;
+    }).join('');
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="4" class="text-center text-danger py-3">${escHtml(e.message)}</td></tr>`;
+  }
+}
+
+// Toggle between plan log and mow history
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('log-view-plan').addEventListener('change', () => {
+    document.getElementById('log-panel-plan').style.display = '';
+    document.getElementById('log-panel-history').style.display = 'none';
+    document.getElementById('log-panel-title').innerHTML =
+      '<i class="bi bi-calendar-check me-2"></i>Planning Log \u2014 Next 7 Days';
+  });
+  document.getElementById('log-view-history').addEventListener('change', async () => {
+    document.getElementById('log-panel-plan').style.display = 'none';
+    document.getElementById('log-panel-history').style.display = '';
+    document.getElementById('log-panel-title').innerHTML =
+      '<i class="bi bi-clock-history me-2"></i>Mowing History (last 90 days)';
+    await loadMowHistory();
+  });
+});
 
 async function loadPlannerForecast() {
   try {
