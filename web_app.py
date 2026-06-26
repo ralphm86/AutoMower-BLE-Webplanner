@@ -932,6 +932,37 @@ async def get_status():
     control_mode = "smart" if _planner_active else "classic"
     smart_context: Optional[str] = None
     if _planner_active:
+        # Determine the end of the session currently in progress (if any).
+        # Prefer the planner's tracked session; otherwise fall back to the
+        # firmware override, which is authoritative and survives server
+        # restarts / reconnects and also covers sessions the planner is no
+        # longer tracking (e.g. after _active_session was cleared while the
+        # mower kept running). A FORCEDMOW override runs from startTime for
+        # `duration` seconds, so the session ends at startTime + duration.
+        active_end_dt: Optional[dt.datetime] = None
+        if planner._active_session:
+            active_end_dt = (
+                planner._active_session["start_dt"]
+                + dt.timedelta(seconds=planner._active_session["duration_sec"])
+            )
+        elif not planner._user_inhibited and activity in (
+            MowerActivity.MOWING,
+            MowerActivity.GOING_OUT,
+            MowerActivity.CHARGING,
+        ):
+            override = await _mower.command("GetOverride")
+            if (
+                override
+                and override.get("action") == OverrideAction.FORCEDMOW
+                and override.get("startTime")
+                and override.get("duration")
+            ):
+                ov_end = dt.datetime.utcfromtimestamp(
+                    override["startTime"] + override["duration"]
+                )
+                if ov_end > dt.datetime.now():
+                    active_end_dt = ov_end
+
         if planner._user_inhibited:
             _next_planned = planner.get_next_planned_session()
             _when = (
@@ -939,20 +970,23 @@ async def get_status():
                 if _next_planned else "no sessions planned"
             )
             smart_context = f"Parked by user — next session ({_when}) will be skipped until you Resume"
-        elif planner._active_session:
-            end_dt = (
-                planner._active_session["start_dt"]
-                + dt.timedelta(seconds=planner._active_session["duration_sec"])
-            )
-            mins_left = max(0, int((end_dt - dt.datetime.now()).total_seconds() / 60))
+        elif active_end_dt is not None:
+            mins_left = max(0, int((active_end_dt - dt.datetime.now()).total_seconds() / 60))
             if activity == MowerActivity.CHARGING:
                 if remaining_charging_min is not None:
                     resume_dt = dt.datetime.now() + dt.timedelta(minutes=remaining_charging_min)
-                    smart_context = f"Charging break — continues ~{resume_dt.strftime('%H:%M')}"
+                    smart_context = (
+                        f"Charging until ~{resume_dt.strftime('%H:%M')}"
+                        f" — mowing until {active_end_dt.strftime('%H:%M')}"
+                    )
                 else:
-                    smart_context = f"Charging break — session ends {end_dt.strftime('%H:%M')}"
+                    smart_context = (
+                        f"Charging — mowing until {active_end_dt.strftime('%H:%M')}"
+                    )
             else:
-                smart_context = f"Active — ends {end_dt.strftime('%H:%M')} ({mins_left} min left)"
+                smart_context = (
+                    f"Mowing until {active_end_dt.strftime('%H:%M')} ({mins_left} min left)"
+                )
         elif _next_planned:
             start = _next_planned["start_dt"]
             smart_context = (

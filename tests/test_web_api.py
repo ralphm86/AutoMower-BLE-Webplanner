@@ -56,6 +56,79 @@ class TestStatus:
         assert body["remaining_charging_min"] == 60.0
         assert body["estimated_next_start_time"] is not None
 
+    def test_smart_context_mowing_from_active_session(self, web, connected_client, monkeypatch):
+        import datetime as dt
+
+        monkeypatch.setattr(web, "planner_load_config", lambda: {"enabled": True})
+        web.planner._user_inhibited = False
+        web.planner._active_session = {
+            "start_dt": dt.datetime.now() - dt.timedelta(minutes=30),
+            "duration_sec": 3600,
+        }
+        body = connected_client.get("/api/status").json()
+        assert body["smart_context"].startswith("Mowing until ")
+
+    def test_smart_context_mowing_from_firmware_override(self, web, connected_client, monkeypatch):
+        # _active_session is None (e.g. after a restart/reconnect) but the mower
+        # is actually mowing under a FORCEDMOW override — the Session field must
+        # still show the current session, not the next planned one.
+        import calendar as _cal
+        import datetime as dt
+        from automower_ble.protocol import OverrideAction
+
+        monkeypatch.setattr(web, "planner_load_config", lambda: {"enabled": True})
+        web.planner._user_inhibited = False
+        web.planner._active_session = None
+
+        start_local = int(_cal.timegm((dt.datetime.now() - dt.timedelta(minutes=15)).timetuple()))
+
+        async def _cmd(name, **kw):
+            if name == "GetOverride":
+                return {
+                    "action": OverrideAction.FORCEDMOW.value,
+                    "startTime": start_local,
+                    "duration": 3600,
+                }
+            return {
+                "GetUserMowerNameAsAsciiString": "Sir Schnittalot",
+                "GetSerialNumber": 1,
+                "GetError": 0,
+                "GetRestrictionReason": 0,
+            }.get(name)
+
+        web._mower.command.side_effect = _cmd
+        body = connected_client.get("/api/status").json()
+        assert body["smart_context"].startswith("Mowing until ")
+
+    def test_smart_context_charging_shows_resume_and_end(self, web, connected_client, monkeypatch):
+        import datetime as dt
+        from automower_ble.protocol import MowerActivity
+
+        monkeypatch.setattr(web, "planner_load_config", lambda: {"enabled": True})
+        web.planner._user_inhibited = False
+        web.planner._active_session = {
+            "start_dt": dt.datetime.now() - dt.timedelta(minutes=30),
+            "duration_sec": 7200,
+        }
+        web._mower.mower_activity.return_value = MowerActivity.CHARGING
+        web._mower.is_charging.return_value = True
+
+        async def _cmd(name, **kw):
+            if name == "GetRemainingChargingTime":
+                return 1800
+            return {
+                "GetUserMowerNameAsAsciiString": "Sir Schnittalot",
+                "GetSerialNumber": 1,
+                "GetError": 0,
+                "GetRestrictionReason": 0,
+            }.get(name)
+
+        web._mower.command.side_effect = _cmd
+        body = connected_client.get("/api/status").json()
+        ctx = body["smart_context"]
+        assert ctx.startswith("Charging until ~")
+        assert "mowing until" in ctx
+
 
 # ─── Connection lifecycle ─────────────────────────────────────────────────────
 class TestConnection:

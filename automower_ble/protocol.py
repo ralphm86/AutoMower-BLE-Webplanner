@@ -184,6 +184,10 @@ class Command:
         return self.request_data
 
     def parse_response(self, response_data: bytearray) -> dict[str, int | str] | None:
+        if len(response_data) <= 17:
+            # Frame is too short to contain a response payload (e.g. a
+            # truncated or spurious frame); treat it as no response.
+            return None
         response_length = response_data[17]
         data = response_data[19 : 19 + response_length]
         response: dict[str, int | str] = {}
@@ -220,6 +224,9 @@ class Command:
         return response
 
     def validate_command_response(self, response_data: bytearray) -> bool:
+        if len(response_data) < 17:
+            return False
+
         if response_data[0] != 0x02:
             return False
 
@@ -265,6 +272,32 @@ class Command:
 
         return True
 
+    def is_matching_response(self, response_data: bytearray) -> bool:
+        """Return True if `response_data` is a well-formed response to *this*
+        command.
+
+        The mower can emit unsolicited or duplicate frames (e.g. transient
+        "busy" frames right after a reconnect while it is still moving). Such
+        frames are well-framed but do not correspond to the command we sent.
+        This check lets the reader skip them and wait for the real reply.
+        """
+        if len(response_data) < 19:
+            return False
+        if response_data[0] != 0x02 or response_data[1] != 0xFD:
+            return False
+        if response_data[10] != 0x01:  # packet type must be 0x01 = response
+            return False
+        if response_data[11] != 0xAF:
+            return False
+        major_bytes = self.major.to_bytes(4, byteorder="little")
+        if response_data[12] != major_bytes[0]:
+            return False
+        if response_data[13] != major_bytes[1]:
+            return False
+        if response_data[14] != self.minor:
+            return False
+        return True
+
 
 class BLEClient:
     def __init__(self, channel_id: int, address, pin=None):
@@ -275,6 +308,16 @@ class BLEClient:
 
         self.lock = asyncio.Lock()
         self.queue: asyncio.Queue[bytearray] = asyncio.Queue()
+        # Raw receive buffer. BLE notifications do not map 1:1 to protocol
+        # frames (terminators can arrive separately and frames/terminators are
+        # often duplicated right after a reconnect), so incoming bytes are
+        # accumulated here and parsed into frames by _read_frame().
+        self._rx_buffer = bytearray()
+        # Last notification payload appended to the buffer. The mower's firmware
+        # delivers every notification several times in a row (observed: each
+        # chunk repeated 3×). These consecutive duplicates are dropped so the
+        # length-based frame reassembler sees a clean fragment stream.
+        self._last_chunk: bytearray | None = None
 
         self.client: BleakClient | None = None
         self.protocol = None
@@ -291,16 +334,6 @@ class BLEClient:
             )
         return self.protocol
 
-    async def _get_response(self):
-        try:
-            data = await asyncio.wait_for(self.queue.get(), timeout=10)
-
-        except TimeoutError:
-            logger.error("Unable to get response from device: '%s'", self.address)
-            return None
-
-        return data
-
     async def _write_data(self, data):
         logger.info("Writing: %s", str(binascii.hexlify(data)))
 
@@ -312,53 +345,137 @@ class BLEClient:
 
         logger.debug("Finished writing")
 
-    async def _read_data(self):
-        data = await self._get_response()
+    async def _read_frame(self):
+        """Assemble a single framed packet from the notification stream.
 
-        if data is None:
-            return None
+        The mower's BLE notifications do not map 1:1 to protocol frames: a
+        frame's trailing 0x03 terminator can arrive in a separate notification,
+        and frames (and bare terminators) are frequently duplicated right after
+        a reconnect while the mower is still settling. This parser accumulates
+        the raw byte stream and extracts the next well-formed frame, resyncing
+        past corruption / duplicates. Returns the frame bytes, or None on
+        timeout / disconnect.
+        """
+        deadline = asyncio.get_event_loop().time() + 15.0
+        while True:
+            frame = self._extract_frame()
+            if frame is not None:
+                return frame
 
-        if len(data) < 3:
-            # We got such a small amount of data, let's try again
-            chunk = await self._get_response()
-            if chunk is None:
-                return None
-            data = data + chunk
-
-            if len(data) < 3:
-                # Something is wrong
-                return None
-
-        length = data[2] + 4
-
-        logger.debug("Waiting for %d bytes", length)
-
-        while len(data) < length:
-            try:
-                data = data + await asyncio.wait_for(self.queue.get(), timeout=5)
-            except TimeoutError:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
                 logger.error(
-                    "Unable to get full response from device: '%s', currently have %s",
-                    str(binascii.hexlify(data)),
+                    "Unable to get response from device: '%s', buffer=%s",
                     self.address,
+                    str(binascii.hexlify(self._rx_buffer)),
                 )
-                logger.error("Expecting %d bytes, only have %d", length, len(data))
                 return None
 
-        logger.info("Final response: %s", str(binascii.hexlify(data)))
+            try:
+                chunk = await asyncio.wait_for(self.queue.get(), timeout=remaining)
+            except TimeoutError:
+                logger.error("Unable to get response from device: '%s'", self.address)
+                return None
 
-        return data
+            if chunk is None:
+                # Disconnect sentinel.
+                return None
 
-    async def _request_response(self, request_data):
+            # Drop consecutive duplicate notifications. The mower repeats every
+            # notification several times in a row; without this the duplicates
+            # interleave with multi-notification frames and break length-based
+            # reassembly (a long response is split across several chunks, each
+            # of which is also triplicated).
+            if self._last_chunk is not None and chunk == self._last_chunk:
+                continue
+            self._last_chunk = bytearray(chunk)
+
+            self._rx_buffer += chunk
+
+    def _extract_frame(self) -> bytearray | None:
+        """Try to pull one complete frame out of the receive buffer.
+
+        A frame is ``02 FD <len> ... <crc> 03`` where the total length is
+        ``buffer[2] + 4``. Leading garbage and bytes from duplicated/corrupt
+        frames are discarded by resyncing on the ``02 FD`` start marker and
+        verifying the trailing ``0x03`` terminator. Returns the frame (and
+        removes it from the buffer) or None when no complete frame is available
+        yet.
+        """
+        buf = self._rx_buffer
+        while True:
+            # Locate the frame start marker 0x02 0xFD.
+            start = -1
+            for i in range(len(buf) - 1):
+                if buf[i] == 0x02 and buf[i + 1] == 0xFD:
+                    start = i
+                    break
+
+            if start < 0:
+                # No marker yet. Keep a trailing lone 0x02 in case the 0xFD is
+                # split into the next notification; otherwise drop the garbage.
+                if buf and buf[-1] == 0x02:
+                    del buf[:-1]
+                else:
+                    buf.clear()
+                return None
+
+            # Discard any garbage preceding the marker.
+            if start > 0:
+                del buf[:start]
+
+            if len(buf) < 3:
+                return None  # need the length byte
+
+            length = buf[2] + 4
+            if len(buf) < length:
+                return None  # frame not fully received yet
+
+            if buf[length - 1] == 0x03:
+                frame = bytearray(buf[:length])
+                del buf[:length]
+                return frame
+
+            # Terminator is not where the length field claims → this marker
+            # begins a corrupt or duplicated frame. Skip past it and resync on
+            # the next 0x02 0xFD marker.
+            del buf[:2]
+
+    async def _read_data(self, is_expected=None):
+        # The mower can emit unsolicited or duplicate frames (e.g. a transient
+        # "busy" frame right after a reconnect while it is still moving). When
+        # the caller knows which response it expects, skip frames that do not
+        # match instead of mistaking a spurious frame for the real reply.
+        while True:
+            data = await self._read_frame()
+
+            if data is None:
+                return None
+
+            if is_expected is not None and not is_expected(data):
+                logger.info(
+                    "Ignoring unexpected frame: %s", str(binascii.hexlify(data))
+                )
+                continue
+
+            logger.info("Final response: %s", str(binascii.hexlify(data)))
+            return data
+
+    async def _request_response(self, request_data, is_expected=None):
         async with self.lock:
             try:
                 # If there are previous responses, flush them out
                 while not self.queue.empty():
                     await self.queue.get()
+                # Drop any partial/stale bytes left in the framing buffer so a
+                # previous command's leftover/duplicate notifications cannot
+                # corrupt this response.
+                self._rx_buffer.clear()
+                self._last_chunk = None
 
                 await self._write_data(request_data)
 
-                response_data = await self._read_data()
+                response_data = await self._read_data(is_expected)
                 if response_data is None:
                     logger.error(
                         "Unable to communicate with device: '%s'", self.address
@@ -464,7 +581,9 @@ class BLEClient:
                 self.channel_id, (await self.get_protocol())["EnterOperatorPin"]
             )
             request = command.generate_request(code=self.pin)
-            response = await self._request_response(request)
+            response = await self._request_response(
+                request, command.is_matching_response
+            )
             if response is None:
                 return ResponseResult.UNKNOWN_ERROR
             result = self.get_response_result(response)
@@ -582,6 +701,9 @@ class BLEClient:
         return data
 
     def validate_response(self, response_data: bytearray) -> bool:
+        if len(response_data) < 17:
+            return False
+
         if response_data[0] != 0x02:
             return False
 
@@ -622,4 +744,10 @@ class BLEClient:
             # logs from official apps. I.e. it is somewhat expected.
             logger.warning("Response failed validation")
 
-        return ResponseResult(response_data[16])
+        if len(response_data) <= 16:
+            # Frame too short to contain a result code; do not index out of range.
+            return ResponseResult.UNKNOWN_ERROR
+        try:
+            return ResponseResult(response_data[16])
+        except ValueError:
+            return ResponseResult.UNKNOWN_ERROR

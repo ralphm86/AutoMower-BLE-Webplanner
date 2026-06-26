@@ -1092,9 +1092,9 @@ async function loadStatus() {
                 <dt class="col-sm-5">Session</dt>
                 <dd class="col-sm-7">
                   ${s.smart_context
-                    ? (s.smart_context.startsWith('Active')
+                    ? (s.smart_context.startsWith('Mowing')
                         ? `<span class="text-success fw-semibold"><i class="bi bi-scissors me-1"></i>${escHtml(s.smart_context)}</span>`
-                        : s.smart_context.startsWith('Charging break')
+                        : s.smart_context.startsWith('Charging')
                           ? `<span class="text-primary"><i class="bi bi-lightning-charge me-1"></i>${escHtml(s.smart_context)}</span>`
                           : s.smart_context.startsWith('Next')
                             ? `<span class="text-body"><i class="bi bi-calendar-event me-1"></i>${escHtml(s.smart_context)}</span>`

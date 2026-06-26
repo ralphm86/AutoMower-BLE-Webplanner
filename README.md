@@ -37,7 +37,7 @@ Details on the reverse-engineering process: https://www.alistair23.me/2024/01/06
 | File / Package | Role |
 |---|---|
 | `automower_ble/protocol.json` | Reverse-engineered BLE command definitions (major/minor IDs, request & response field types) |
-| `automower_ble/protocol.py` | Low-level BLE client: packet encoding/decoding, CRC, connection handshake |
+| `automower_ble/protocol.py` | Low-level BLE client: packet encoding/decoding, CRC, connection handshake, and resilient frame reassembly (handles fragmented, duplicated, and out-of-order notifications) |
 | `automower_ble/mower.py` | High-level mower API: `connect`, `set_schedule`, `mower_park`, `set_time`, etc. |
 | `automower_ble/models.py` | Mapping of `(deviceType, deviceVariant)` codes to human-readable model names |
 | `automower_ble/error_codes.py` | Enumeration of mower error / message codes |
@@ -61,7 +61,7 @@ Details on the reverse-engineering process: https://www.alistair23.me/2024/01/06
 - **BLE pairing & control** — scan, connect, pair (with optional PIN), send all standard commands
 - **Smart vs Classic control mode** — when the planner is enabled the app runs in **Smart** mode (commands cooperate with the planner's executor and session tracking); otherwise **Classic** mode issues raw firmware commands. See [Control Modes](#control-modes) below.
 - **Schedule editor** — read the current 7-day schedule, edit it visually, push it back to the mower (locked while the planner owns the schedule)
-- **Auto-reconnect** — background loop re-connects automatically after a dropout, recovering from BlueZ "zombie" links
+- **Auto-reconnect** — background loop re-connects automatically after a dropout, recovering from BlueZ "zombie" links. The protocol layer reassembles fragmented BLE notifications, drops the firmware's duplicate-notification floods, and skips unsolicited frames so a reconnect mid-mow recovers cleanly
 - **BLE idle sleep** — disconnects automatically when the web UI is idle and the mower is parked, then reconnects on the next request or upcoming planned session, to save energy
 - **Clock sync** — mower clock synced to local time on every connect
 - **Weather planner** — fetches hourly forecasts from [Open-Meteo](https://open-meteo.com) (free, no API key) and computes optimal mowing slots respecting:
@@ -222,7 +222,7 @@ The app behaves differently depending on whether the **planner** is enabled (tog
 | **Resume** | `ClearOverride` + AUTO + start | Clears the inhibit and restores the active session window without cancelling the executor's override |
 | **Park** (skip session) | Park until next firmware start | Cancels the current session only; the next planned session runs normally |
 
-In Smart mode the **Status** tab shows a *control context* line (e.g. "Active — ends 18:30", "Charging break — continues ~17:05", or "Parked by user — next session will be skipped").
+In Smart mode the **Status** tab's **Session** field shows the live session context (e.g. "Mowing until 18:30 (45 min left)", "Charging until ~17:05 — mowing until 18:30", "Next: Fri 27 Jun at 09:00 (90 min)", or "Parked by user — next session will be skipped"). While a session is running it always reflects the *current* session — derived from the planner's tracked session, or, after a restart/reconnect, from the firmware override — rather than the next planned one.
 
 ---
 
