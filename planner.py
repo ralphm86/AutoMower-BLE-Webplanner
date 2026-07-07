@@ -27,6 +27,21 @@ from automower_ble.protocol import TaskInformation, MowerActivity
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path("planner_config.json")
+MOW_HISTORY_PATH = Path("mow_history.json")
+PLANNED_SESSIONS_PATH = Path("planned_sessions.json")
+PLAN_LOG_PATH = Path("plan_log.json")
+_MOW_HISTORY_RETAIN_DAYS = 90
+
+# Placeholder task installed in the mower's firmware scheduler when the
+# direct-command planner is active.  The firmware requires at least one task
+# so we park a harmless 1-minute slot on Monday at 00:01 that will never
+# coincide with a real session.  The executor always wins via SetOverrideMow.
+_PLACEHOLDER_TASK = TaskInformation(
+    next_start_time=60,          # 00:01 Monday
+    duration_in_seconds=60,      # 1 minute
+    on_monday=True, on_tuesday=False, on_wednesday=False,
+    on_thursday=False, on_friday=False, on_saturday=False, on_sunday=False,
+)
 
 DAY_NAMES = [
     "Monday", "Tuesday", "Wednesday", "Thursday",
@@ -58,6 +73,10 @@ DEFAULT_CONFIG: dict = {
     # Weather watchdog: monitors current conditions while the mower is active
     "watchdog_enabled": False,
     "watchdog_interval_minutes": 5,
+    # Minutes to wait after the weather clears before the watchdog resumes the
+    # mower, so the lawn can dry (0 = resume immediately).  If the drying delay
+    # outlasts the interrupted session's window, the planner replans instead.
+    "watchdog_dry_delay_minutes": 0,
     # Hedgehog protection: restrict mowing to daylight hours (sunrise–sunset)
     "hedgehog_protection": False,
     # Heat stress protection: avoid mowing during peak heat; reduce frequency on hot days
@@ -76,6 +95,61 @@ DEFAULT_CONFIG: dict = {
 }
 
 
+def load_planned_sessions() -> list[dict]:
+    """
+    Load persisted planned sessions from disk.  Entries whose start_dt is in
+    the past are silently discarded so stale sessions never get dispatched.
+    """
+    if not PLANNED_SESSIONS_PATH.exists():
+        return []
+    try:
+        raw = json.loads(PLANNED_SESSIONS_PATH.read_text())
+        now = dt.datetime.now()
+        sessions = []
+        for s in raw:
+            try:
+                s["start_dt"] = dt.datetime.fromisoformat(s["start_dt"])
+                if s["start_dt"] > now:
+                    sessions.append(s)
+            except Exception:
+                pass
+        return sorted(sessions, key=lambda s: s["start_dt"])
+    except Exception as e:
+        logger.warning("Could not load planned sessions: %s", e)
+        return []
+
+
+def save_planned_sessions(sessions: list[dict]) -> None:
+    """Persist planned sessions to disk (start_dt serialised as ISO string)."""
+    try:
+        serialisable = [
+            {**s, "start_dt": s["start_dt"].isoformat()}
+            for s in sessions
+        ]
+        PLANNED_SESSIONS_PATH.write_text(json.dumps(serialisable, indent=2))
+    except Exception as e:
+        logger.warning("Could not save planned sessions: %s", e)
+
+
+def load_plan_log() -> list[dict]:
+    """Load the last planning log from disk, or return an empty list."""
+    if not PLAN_LOG_PATH.exists():
+        return []
+    try:
+        return json.loads(PLAN_LOG_PATH.read_text())
+    except Exception as e:
+        logger.warning("Could not load plan log: %s", e)
+        return []
+
+
+def save_plan_log(log: list[dict]) -> None:
+    """Persist the planning log to disk."""
+    try:
+        PLAN_LOG_PATH.write_text(json.dumps(log, indent=2, default=str))
+    except Exception as e:
+        logger.warning("Could not save plan log: %s", e)
+
+
 # ─── Config I/O ───────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
@@ -92,6 +166,79 @@ def load_config() -> dict:
 def save_config(config: dict) -> None:
     with CONFIG_PATH.open("w") as f:
         json.dump(config, f, indent=2, default=str)
+
+
+# ─── Mow history ──────────────────────────────────────────────────────────────
+# Tracks actual mowing dates/durations so the planner seeds the interval
+# constraint from reality (not from the schedule, which may differ when the
+# mower was parked by weather, manual override, or a missed session).
+
+def load_mow_history() -> dict:
+    """Load {date_str: {mow_sec, complete, last_updated}} from disk."""
+    if MOW_HISTORY_PATH.exists():
+        try:
+            return json.loads(MOW_HISTORY_PATH.read_text())
+        except Exception as e:
+            logger.warning("Could not load mow history: %s", e)
+    return {}
+
+
+def save_mow_history(history: dict) -> None:
+    """Persist mow history, pruning entries older than _MOW_HISTORY_RETAIN_DAYS."""
+    cutoff = (dt.date.today() - dt.timedelta(days=_MOW_HISTORY_RETAIN_DAYS)).isoformat()
+    history = {d: v for d, v in history.items() if d >= cutoff}
+    try:
+        MOW_HISTORY_PATH.write_text(json.dumps(history, indent=2, default=str))
+    except Exception as e:
+        logger.warning("Could not save mow history: %s", e)
+
+
+def record_mowing_day(
+    date: dt.date,
+    mow_sec: int,
+    complete: bool = True,
+) -> None:
+    """
+    Accumulate *mow_sec* of actual mowing time for *date* in the persistent
+    history.  Multiple calls for the same date are additive so a day with
+    two separate runs (or sampler restarts) accumulates the correct total.
+    """
+    if mow_sec <= 0:
+        return
+    history = load_mow_history()
+    date_str = date.isoformat()
+    existing = history.get(date_str, {"mow_sec": 0})
+    new_total = existing["mow_sec"] + mow_sec
+    history[date_str] = {
+        "mow_sec": new_total,
+        "complete": complete,
+        "last_updated": dt.datetime.now().isoformat(timespec="seconds"),
+    }
+    save_mow_history(history)
+    logger.debug(
+        "Mow history: %s += %ds \u2192 total %ds (complete=%s)",
+        date_str, mow_sec, new_total, complete,
+    )
+
+
+def get_last_mow_date(days_back: int = 60) -> Optional[dt.date]:
+    """
+    Return the most recent date within *days_back* days that has recorded
+    mowing activity.  Returns None when no history is available.
+    """
+    history = load_mow_history()
+    today = dt.date.today()
+    for back in range(1, days_back + 1):
+        candidate = today - dt.timedelta(days=back)
+        if candidate.isoformat() in history:
+            return candidate
+    return None
+
+
+def get_mow_sec_today() -> int:
+    """Return total recorded (completed) mowing seconds for today."""
+    history = load_mow_history()
+    return int(history.get(dt.date.today().isoformat(), {}).get("mow_sec", 0))
 
 
 # ─── Weather fetching (Open-Meteo — free, no API key) ────────────────────────
@@ -335,6 +482,13 @@ def forecast_to_serialisable(periods: list[dict]) -> list[dict]:
 
 # ─── Planning logic ────────────────────────────────────────────────────────────
 
+# Minimum useful last mowing stint when snapping a session to a charge-cycle
+# boundary.  If the final mowing segment within a session would be shorter than
+# this, the session is trimmed back so the mower doesn't bother going out for
+# a pointless short run.  Intentionally independent of min_duration_minutes
+# (which controls minimum session length, not minimum useful last stint).
+_SNAP_MIN_PARTIAL_SEC = 30 * 60  # 30 minutes
+
 def _find_best_subwindow(
     periods: list[dict],
     date: dt.date,
@@ -484,22 +638,138 @@ def _find_best_subwindow(
     return best_start_sec, session_sec, f"Good — {best_reason}" if best_reason else "Good"
 
 
+def _effective_window_sec(
+    target_mow_sec: int,
+    mow_sec: float,
+    chg_sec: float,
+) -> int:
+    """
+    Return the total wall-clock window duration (seconds) needed to achieve
+    *target_mow_sec* of actual mowing, given the mower's observed charge-cycle
+    behaviour.
+
+    The mower always charges to 100 % between mowing runs:
+      Mow → home → charge → mow → home → charge → … → final mow
+
+    For N total mowing segments (one per charge cycle), there are (N-1) charges
+    between them:
+      total = N * mow_sec_per_seg + (N-1) * chg_sec
+
+    where the last segment is a partial one if target is not a whole multiple of
+    mow_sec.
+    """
+    if mow_sec <= 0 or chg_sec < 0:
+        return target_mow_sec
+    n_full = int(target_mow_sec / mow_sec)
+    rem_mow_sec = target_mow_sec - n_full * mow_sec
+    # Number of charges: one per completed cycle, plus one more if there is a
+    # partial tail segment that requires the mower to charge first.
+    if rem_mow_sec > 60:          # meaningful tail → one extra charge
+        n_charges = n_full
+    else:                         # target is (nearly) a whole multiple
+        n_charges = max(0, n_full - 1)
+    return int(n_full * mow_sec + rem_mow_sec + n_charges * chg_sec)
+
+
+def _snap_to_cycle_boundary(
+    sess_s: int,
+    mow_sec: float,
+    chg_sec: float,
+    min_partial_sec: int,
+) -> int:
+    """
+    Snap a session duration to a clean charge-cycle boundary.
+
+    The mower's runtime pattern within a session is:
+      mow → home → charge → mow → home → charge → … → (partial) mow
+
+    If the final mowing segment would be shorter than *min_partial_sec*, the
+    session is shortened so that it ends right after the preceding full charge
+    finishes (the mower is home, battery full, and the session simply ends
+    without sending it out for the short pointless stint).
+
+    The first mowing segment is never dropped (``elapsed == 0`` guard), so a
+    window that is already shorter than one full cycle is returned unchanged.
+    """
+    if mow_sec <= 0 or chg_sec <= 0:
+        return sess_s
+    elapsed = 0.0
+    while True:
+        # --- mowing segment ---
+        next_elapsed = elapsed + mow_sec
+        if next_elapsed >= sess_s:
+            # Partial mowing segment: check if it's long enough
+            partial = sess_s - elapsed
+            if partial < min_partial_sec and elapsed > 0:
+                # Too short — snap session to end right after the preceding charge
+                return int(elapsed)
+            return sess_s  # acceptable partial (or the only segment)
+        elapsed = next_elapsed
+        # --- charging segment ---
+        next_elapsed = elapsed + chg_sec
+        if next_elapsed >= sess_s:
+            # Session ends while the mower is still charging — that's fine
+            return sess_s
+        elapsed = next_elapsed
+
+
 def plan_schedule(
     config: dict,
     forecast_periods: list[dict],
     daily: Optional[dict] = None,
-) -> tuple[list[TaskInformation], list[dict]]:
+    seeded_last_mow_date: Optional[dt.date] = None,
+    cycle_data: Optional[dict] = None,
+    already_mowed_today_sec: int = 0,
+) -> tuple[list[dict], list[dict]]:
     """
     Build a mowing schedule for the next 7 days.
 
-    Returns (tasks, planning_log).
-    planning_log is a list of per-day decision dicts for display.
+    Returns (sessions, planning_log).
+    sessions is a list of dicts with keys: start_dt (datetime), duration_sec,
+    date (ISO string), dow_name.  planning_log is a list of per-day decision
+    dicts for display.
+
+    *seeded_last_mow_date* is the most-recent past date with recorded actual
+    mowing (from mow_history.json, not schedule-derived).  When provided it is
+    used as the initial ``last_mow_date`` so the interval constraint is
+    correctly enforced across replans even when sessions were missed.
+
+    *cycle_data* is an optional dict with keys ``avg_mow_h`` and ``avg_chg_h``
+    derived from observed discharge/charge rates.  When present, the scheduled
+    window duration is inflated so the actual mowing time matches the target.
+
+    *already_mowed_today_sec* is the total actual mowing seconds accumulated
+    today (completed sessions + any ongoing session).  The planner deducts
+    this from today's target so a mid-day replan only schedules the remainder.
     """
     today = dt.date.today()
 
     min_dur_sec = int(config.get("min_duration_minutes", 30)) * 60
     max_dur_sec = int(config.get("max_duration_minutes", 180)) * 60
-    target_dur_sec = int(float(config.get("target_hours_per_day", 2.0)) * 3600)
+    target_mow_sec = int(float(config.get("target_hours_per_day", 2.0)) * 3600)
+
+    # When cycle data is available, inflate the window so the mower actually
+    # achieves target_mow_sec of cutting time (rather than target_mow_sec of
+    # wall-clock time which includes charging pauses).
+    _cycle_note = ""
+    if cycle_data and cycle_data.get("avg_mow_h") and cycle_data.get("avg_chg_h"):
+        mow_s = cycle_data["avg_mow_h"] * 3600
+        chg_s = cycle_data["avg_chg_h"] * 3600
+        target_dur_sec = _effective_window_sec(target_mow_sec, mow_s, chg_s)
+        _h = target_dur_sec // 3600
+        _m = (target_dur_sec % 3600) // 60
+        _mow_m = target_mow_sec // 60
+        _cycle_note = (
+            f" [cycle-aware: {_mow_m}m mowing target → "
+            f"{_h}h {_m:02d}m window]"
+        )
+        logger.debug(
+            "Planner: cycle-aware window sizing: target_mow=%ds → window=%ds "
+            "(avg_mow=%.0fs avg_chg=%.0fs)",
+            target_mow_sec, target_dur_sec, mow_s, chg_s,
+        )
+    else:
+        target_dur_sec = target_mow_sec
     interval_days = max(1, int(config.get("mowing_interval_days", 2)))
     max_rain = float(config.get("max_rain_mm_h",
                                 config.get("max_rain_mm_3h", 0.5)))  # fallback for old configs
@@ -518,9 +788,9 @@ def plan_schedule(
 
     windows: list[dict] = config.get("available_windows", [])
 
-    tasks: list[TaskInformation] = []
+    sessions: list[dict] = []
     log: list[dict] = []
-    last_mow_date: Optional[dt.date] = None
+    last_mow_date: Optional[dt.date] = seeded_last_mow_date
     now = dt.datetime.now()
 
     for offset in range(7):
@@ -564,13 +834,33 @@ def plan_schedule(
         # 3-5. Iterate over ALL configured windows for this day and accumulate
         #      sessions until the daily target is met or windows are exhausted.
         day_sessions: list[tuple[int, int, str]] = []  # (start_sec, dur_sec, reason)
-        remaining_sec = target_dur_sec
+        # For today: if some mowing has already happened, deduct it from the
+        # target so a mid-day replan only schedules the remaining time rather
+        # than the full target again.  Snap / cycle-aware window are
+        # recalculated from the reduced mowing target.
+        if offset == 0 and already_mowed_today_sec > 0:
+            rem_mow = max(0, target_mow_sec - already_mowed_today_sec)
+            if rem_mow < min_dur_sec:
+                _log(
+                    "complete",
+                    f"Daily target met: {already_mowed_today_sec // 60}min of "
+                    f"{target_mow_sec // 60}min target already mowed today",
+                )
+                last_mow_date = date  # count today as mow day for interval
+                continue
+            remaining_sec = (
+                _effective_window_sec(rem_mow, mow_s, chg_s)
+                if cycle_data and cycle_data.get("avg_mow_h") and cycle_data.get("avg_chg_h")
+                else rem_mow
+            )
+        else:
+            remaining_sec = target_dur_sec
         fail_status = "weather"
         fail_reason = "No suitable weather window found"
 
         for win in day_windows:
-            if remaining_sec < min_dur_sec or len(day_sessions) >= 2:
-                break  # daily target met or mower's 2-slot-per-day limit reached
+            if remaining_sec < min_dur_sec:
+                break  # daily target met
 
             w_start_h = int(win["start_hour"])
             w_end_h   = int(win["end_hour"])
@@ -683,10 +973,13 @@ def plan_schedule(
                         continue
 
             # Keep finding sub-windows within this window until target is met
-            # (mower firmware allows at most 2 tasks per day across all windows)
+            # For today, never search a start time in the past — a mid-day
+            # replan (e.g. after a weather park) must schedule from now onward.
+            if offset == 0:
+                now_sec_of_day = now.hour * 3600 + now.minute * 60 + now.second
+                search_start_sec = max(search_start_sec, now_sec_of_day)
             while (remaining_sec >= min_dur_sec
-                   and search_start_sec < w_end_h * 3600
-                   and len(day_sessions) < 2):
+                   and search_start_sec < w_end_h * 3600):
                 start_s, sess_s, reason = _find_best_subwindow(
                     forecast_periods, date, w_start_h, w_end_h,
                     max_rain, max_wind, min_temp,
@@ -712,6 +1005,36 @@ def plan_schedule(
                                 f"({ss_dt.strftime('%H:%M')}\u2193)"
                             )
                             break
+                # Cycle boundary snap: avoid a very short last mowing segment.
+                # If the session would end with a partial mowing run shorter
+                # than min_dur_sec, trim it back so the session ends cleanly
+                # right after the preceding charge (mower is home and idle).
+                if cycle_data and cycle_data.get("avg_mow_h") and cycle_data.get("avg_chg_h"):
+                    logger.debug(
+                        "Planner: cycle snap check %s start=%ds dur=%ds "
+                        "(min_partial=%ds)",
+                        date.isoformat(), start_s, sess_s, _SNAP_MIN_PARTIAL_SEC,
+                    )
+                    snapped = _snap_to_cycle_boundary(
+                        sess_s,
+                        cycle_data["avg_mow_h"] * 3600,
+                        cycle_data["avg_chg_h"] * 3600,
+                        _SNAP_MIN_PARTIAL_SEC,
+                    )
+                    if snapped != sess_s:
+                        logger.debug(
+                            "Planner: cycle snap %s %ds → %ds "
+                            "(last segment < %ds min)",
+                            date.isoformat(), sess_s, snapped, min_dur_sec,
+                        )
+                        sess_s = snapped
+                    if sess_s < min_dur_sec:
+                        fail_status = "weather"
+                        fail_reason = (
+                            "Session too short after cycle-boundary snap "
+                            f"({sess_s // 60} min < min {min_dur_sec // 60} min)"
+                        )
+                        break
                 day_sessions.append((start_s, sess_s, reason))
                 remaining_sec -= sess_s
                 search_start_sec = start_s + sess_s  # next search starts after this session
@@ -720,17 +1043,15 @@ def plan_schedule(
             _log(fail_status, fail_reason)
             continue
 
-        # ✓ Create a TaskInformation for every planned session
-        flags = [False] * 7
-        flags[dow] = True
+        # ✓ Record as absolute-datetime sessions
         for (start_s, sess_s, _) in day_sessions:
-            tasks.append(TaskInformation(
-                next_start_time=start_s,
-                duration_in_seconds=sess_s,
-                on_monday=flags[0], on_tuesday=flags[1], on_wednesday=flags[2],
-                on_thursday=flags[3], on_friday=flags[4],
-                on_saturday=flags[5], on_sunday=flags[6],
-            ))
+            start_dt = dt.datetime.combine(date, dt.time(0, 0)) + dt.timedelta(seconds=start_s)
+            sessions.append({
+                "start_dt": start_dt,
+                "duration_sec": sess_s,
+                "date": date.isoformat(),
+                "dow_name": DAY_NAMES[dow],
+            })
         last_mow_date = date
 
         log_reason = (
@@ -738,6 +1059,8 @@ def plan_schedule(
             if len(day_sessions) == 1
             else f"{len(day_sessions)} sessions planned"
         )
+        if _cycle_note:
+            log_reason += _cycle_note
         _log(
             "scheduled",
             log_reason,
@@ -750,19 +1073,7 @@ def plan_schedule(
             ],
         )
 
-    return tasks, log
-
-
-def _tasks_fingerprint(tasks: list[TaskInformation]) -> list[tuple]:
-    """Canonical sortable representation used to detect unchanged schedules."""
-    return sorted(
-        (
-            t.next_start_time, t.duration_in_seconds,
-            t.on_monday, t.on_tuesday, t.on_wednesday,
-            t.on_thursday, t.on_friday, t.on_saturday, t.on_sunday,
-        )
-        for t in tasks
-    )
+    return sessions, log
 
 
 # ─── Background agent ─────────────────────────────────────────────────────────
@@ -784,39 +1095,139 @@ class PlannerAgent:
         # planner loop waits for the mower to be reachable before the first push.
         self._startup_event: Optional[asyncio.Event] = None
 
-        self.last_log: list[dict] = []
+        self.last_log: list[dict] = load_plan_log()
         self.last_run: Optional[str] = None
         self.last_result: str = "Never run"
+        self.next_run_dt: Optional[dt.datetime] = None
         self.last_forecast: list[dict] = []
         self.last_daily: dict = {}
-        self._last_pushed_fp: Optional[list[tuple]] = None  # None = not yet verified against mower
-        # Tasks computed but not yet pushed (mower busy or disconnected at plan time).
-        # The retry loop attempts to push these every 2 min when conditions are safe.
-        self._pending_tasks: Optional[list] = None
-        self._retry_task: Optional[asyncio.Task] = None
+        # Planned sessions (absolute datetimes) computed by the last run_once().
+        # The executor loop dispatches these at the right time.
+        # Loaded from disk on startup so sessions survive server restarts.
+        self._planned_sessions: list[dict] = load_planned_sessions()
+        self._active_session: Optional[dict] = None   # currently running session
+        self._executor_task: Optional[asyncio.Task] = None
+        # True when the executor is within _PRE_CONNECT_S seconds of a session start.
+        # Used by the BLE idle-sleep logic to keep the connection alive.
+        self._needs_connection: bool = False
+        # Last successfully fetched cycle data from the mower (persists across
+        # replans so the snap and window sizing still work when the mower is
+        # temporarily disconnected at plan time).
+        self._cycle_data: Optional[dict] = None
+        # Optional callable (set by web_app) that returns sample-derived cycle
+        # data {avg_mow_h, avg_chg_h} based on observed discharge/charge rates.
+        # Takes priority over the mower's lifetime statistics averages because
+        # it reflects recent real behaviour rather than all-time averages.
+        self._cycle_data_provider: Optional[Callable] = None
+        # Optional callable returning total actual mowing seconds for today
+        # (completed sessions from history + any ongoing session tracked by
+        # the sampler).  Used to deduct already-mowed time from today's target.
+        self._mow_today_provider: Optional[Callable] = None
+        # Set to True when the user manually parks the mower in Smart mode.
+        # The executor skips dispatching sessions while this is True.
+        # Cleared when the user issues a Resume command.
+        self._user_inhibited: bool = False
 
     def set_mower_provider(self, provider: Callable) -> None:
         """Register a callable that returns the current Mower (or None)."""
         self._get_mower = provider
 
+    def set_cycle_data_provider(self, provider: Callable) -> None:
+        """
+        Register a callable that returns sample-derived cycle data or None.
+
+        The callable must return either
+          {"avg_mow_h": float, "avg_chg_h": float}
+        or None when not enough sample history is available yet.
+        When it returns data it takes priority over GetAllStatistics averages.
+        """
+        self._cycle_data_provider = provider
+
+    def set_mow_today_provider(self, provider: Callable) -> None:
+        """
+        Register a callable that returns the total mowing seconds for today
+        (completed sessions in mow_history.json + any ongoing session tracked
+        by the sampler).  Used by run_once() to deduct progress from today's
+        target before building the schedule.
+        """
+        self._mow_today_provider = provider
+
+    def _has_session_window_active_or_upcoming(self) -> bool:
+        """
+        Return True if a mowing session for today is currently active (its
+        scheduled window has started but not yet ended) or starts within the
+        next 60 minutes.
+
+        Used by the BLE idle-sleep logic so the connection stays alive during
+        scheduled sessions, enabling the sampler to collect accurate data.
+        """
+        now = dt.datetime.now()
+        # Check currently running session
+        if self._active_session:
+            end_dt = (
+                self._active_session["start_dt"]
+                + dt.timedelta(seconds=self._active_session["duration_sec"])
+            )
+            if now < end_dt:
+                return True
+        # Check upcoming planned sessions (within 60 min)
+        for sess in self._planned_sessions:
+            end_dt = sess["start_dt"] + dt.timedelta(seconds=sess["duration_sec"])
+            secs_until_start = (sess["start_dt"] - now).total_seconds()
+            if now < end_dt and secs_until_start <= 3600:
+                return True
+        return False
+
     def set_startup_event(self, event: asyncio.Event) -> None:
         """Supply an event that is set when the startup connect attempt completes."""
         self._startup_event = event
+
+    def is_replan_due(self) -> bool:
+        """
+        Return True if a replan is due, using the same wakeup logic as ``_loop``:
+          - interval elapsed (``replan_interval_hours``), OR
+          - the fixed ``replan_time`` (HH:MM) has passed since the last run.
+        Always returns True when no run has occurred yet.
+        """
+        if self.last_run is None:
+            return True
+        config = load_config()
+        interval_h = max(0.1, float(config.get("replan_interval_hours", 6)))
+        replan_time_str = config.get("replan_time", "")
+        try:
+            last = dt.datetime.fromisoformat(self.last_run)
+            now = dt.datetime.now()
+            if (now - last).total_seconds() / 3600 >= interval_h:
+                return True
+            # Check if the fixed replan_time has passed since the last run
+            if replan_time_str and replan_time_str.strip():
+                try:
+                    h, m = map(int, replan_time_str.strip().split(":"))
+                    target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+                    if target > now:
+                        target -= dt.timedelta(days=1)
+                    if target > last:
+                        return True
+                except (ValueError, AttributeError):
+                    pass
+            return False
+        except Exception:
+            return True
 
     def is_running(self) -> bool:
         return bool(self._bg_task and not self._bg_task.done())
 
     def start(self) -> None:
         if not self.is_running():
-            self._stop_event = asyncio.Event()
-            self._bg_task   = asyncio.create_task(self._loop())
-            self._retry_task = asyncio.create_task(self._retry_push_loop())
+            self._stop_event    = asyncio.Event()
+            self._bg_task       = asyncio.create_task(self._loop())
+            self._executor_task = asyncio.create_task(self._session_executor_loop())
             logger.info("PlannerAgent started")
 
     async def stop(self) -> None:
         if self._stop_event:
             self._stop_event.set()
-        for task in (self._bg_task, self._retry_task):
+        for task in (self._bg_task, self._executor_task):
             if task and not task.done():
                 task.cancel()
                 try:
@@ -878,57 +1289,96 @@ class PlannerAgent:
         self.last_forecast = forecast_to_serialisable(periods)
         self.last_daily    = daily_to_serialisable(daily)
 
-        tasks, log = plan_schedule(config, periods, daily=daily)
-        self.last_log = log
+        # ── Cycle data: try sample-derived rates first (most accurate), then
+        # fall back to mower's lifetime statistics averages.
+        cycle_data: Optional[dict] = None
+        if self._cycle_data_provider:
+            try:
+                cycle_data = self._cycle_data_provider()
+                if cycle_data:
+                    logger.debug(
+                        "Planner: using learned cycle data — "
+                        "avg_mow=%.2fh avg_chg=%.2fh",
+                        cycle_data["avg_mow_h"], cycle_data["avg_chg_h"],
+                    )
+            except Exception as e:
+                logger.debug("Planner: cycle data provider error: %s", e)
 
-        msg = f"Planned {len(tasks)} mowing session(s)"
+        # ── Seed last_mow_date from the persistent mow history (actual mowing
+        # dates, not schedule-derived) so the interval constraint is correct
+        # even after missed sessions, rain-forced parks, or replans.
+        seed_date: Optional[dt.date] = get_last_mow_date()
+        if seed_date:
+            logger.debug(
+                "Planner: seeding last_mow_date from mow history: %s", seed_date,
+            )
+
+        # ── Total mowing today (completed + ongoing), provided by the sampler.
+        already_mowed_today_sec: int = 0
+        if self._mow_today_provider:
+            try:
+                already_mowed_today_sec = int(self._mow_today_provider() or 0)
+            except Exception as e:
+                logger.debug("Planner: mow_today_provider error: %s", e)
+        else:
+            already_mowed_today_sec = get_mow_sec_today()
+
         mower = self._get_mower() if self._get_mower else None
         if mower and mower.is_connected():
-            new_fp = _tasks_fingerprint(tasks)
+            try:
+                if cycle_data is None:
+                    stats = await mower.command("GetAllStatistics")
+                    if stats and stats.get("numberOfChargingCycles", 0) > 0:
+                        n = stats["numberOfChargingCycles"]
+                        avg_mow_h = stats["totalCuttingTime"] / n / 3600
+                        avg_chg_h = stats["totalChargingTime"] / n / 3600
+                        cycle_data = {"avg_mow_h": avg_mow_h, "avg_chg_h": avg_chg_h}
+                        logger.debug(
+                            "Planner: cycle data from mower stats — "
+                            "avg_mow=%.2fh avg_chg=%.2fh",
+                            avg_mow_h, avg_chg_h,
+                        )
+            except Exception as e:
+                logger.warning("Planner: could not read mower stats for cycle data: %s", e)
 
-            # Fast path: in-memory fingerprint matches — no BLE traffic needed
-            if new_fp == self._last_pushed_fp:
-                self._pending_tasks = None  # already up to date
-                msg += " — schedule unchanged (cached), push skipped"
-            else:
-                # Check mower activity before doing anything
-                try:
-                    activity = await mower.mower_activity()
-                except Exception as e:
-                    activity = None
-                    logger.warning("Planner: could not read mower activity: %s", e)
+        # Update cache with whatever we obtained this run; fall back to cache
+        # when this run yielded nothing (mower offline, provider returned None).
+        if cycle_data is not None:
+            self._cycle_data = cycle_data
+        elif self._cycle_data is not None:
+            cycle_data = self._cycle_data
+            logger.debug(
+                "Planner: using cached cycle data — avg_mow=%.2fh avg_chg=%.2fh",
+                cycle_data["avg_mow_h"], cycle_data["avg_chg_h"],
+            )
 
-                _SAFE = {MowerActivity.PARKED, MowerActivity.CHARGING, MowerActivity.NONE}
-                if activity not in _SAFE:
-                    act_name = activity.name if activity else "unknown"
-                    self._pending_tasks = tasks  # will retry when mower is safe
-                    msg += (f" — push skipped: mower is {act_name} "
-                            f"(retry pending)")
-                else:
-                    # Read-before-write: pull the real schedule and compare
-                    try:
-                        current_tasks = await mower.get_all_tasks()
-                        current_fp = _tasks_fingerprint(current_tasks)
-                    except Exception as e:
-                        current_fp = None
-                        logger.warning("Planner: could not read current schedule: %s", e)
+        sessions, log = plan_schedule(config, periods, daily=daily,
+                                      seeded_last_mow_date=seed_date,
+                                      cycle_data=cycle_data,
+                                      already_mowed_today_sec=already_mowed_today_sec)
+        self.last_log = log
+        save_plan_log(log)
 
-                    if current_fp == new_fp:
-                        # Mower already has the correct schedule
-                        self._last_pushed_fp = new_fp
-                        msg += " — mower schedule already up to date, push skipped"
-                    else:
-                        try:
-                            await mower.set_schedule(tasks)
-                            self._last_pushed_fp = new_fp
-                            self._pending_tasks = None
-                            msg += " — schedule pushed to mower ✓"
-                        except Exception as e:
-                            self._pending_tasks = tasks  # will retry
-                            msg += f" — push failed: {e}"
+        # Store future sessions; discard any that are already past.
+        now_dt = dt.datetime.now()
+        self._planned_sessions = sorted(
+            [s for s in sessions if s["start_dt"] > now_dt],
+            key=lambda s: s["start_dt"],
+        )
+        save_planned_sessions(self._planned_sessions)
+        msg = f"Planned {len(sessions)} session(s) for next 7 days"
+        if self._planned_sessions:
+            nxt = self._planned_sessions[0]
+            msg += (
+                f" — next: {nxt['date']} {nxt['start_dt'].strftime('%H:%M')}"
+                f" for {nxt['duration_sec'] // 60} min"
+            )
         else:
-            self._pending_tasks = tasks  # will retry when mower connects
-            msg += " — mower not connected (push pending retry)"
+            msg += " — no upcoming sessions"
+
+        # Ensure placeholder task is installed while planner owns the scheduler.
+        if mower and mower.is_connected():
+            await self._install_placeholder_if_needed(mower)
 
         now_str = dt.datetime.now().isoformat(timespec="seconds")
         self.last_run = now_str
@@ -939,66 +1389,190 @@ class PlannerAgent:
 
         return self._set_result(msg)
 
-    async def _retry_push_loop(self) -> None:
-        """
-        Retry loop: every 2 minutes, attempt to push ``_pending_tasks`` to the
-        mower if it is now connected and in a safe state (PARKED / CHARGING).
+    def get_next_planned_session(self) -> Optional[dict]:
+        """Return the soonest future planned session, or None."""
+        now = dt.datetime.now()
+        future = [s for s in self._planned_sessions if s["start_dt"] > now]
+        if not future:
+            return None
+        return min(future, key=lambda s: s["start_dt"])
 
-        This covers two cases that ``run_once`` cannot handle itself:
-          1. Mower was disconnected at plan time — reconnect triggered by the
-             user manually (auto-reconnect triggers a full ``run_once`` instead).
-          2. Mower was mowing at plan time — no event fires when mowing ends.
+    async def _install_placeholder_if_needed(self, mower) -> None:
         """
-        _RETRY_INTERVAL_S = 120
-        _SAFE = {MowerActivity.PARKED, MowerActivity.CHARGING, MowerActivity.NONE}
+        Ensure the mower's firmware scheduler holds exactly the placeholder task.
+        Only writes if the current task list differs, avoiding unnecessary BLE traffic.
+        """
+        try:
+            num = await mower.command("GetNumberOfTasks")
+            if num == 1:
+                existing = await mower.get_task(0)
+                if (existing
+                        and existing.next_start_time == _PLACEHOLDER_TASK.next_start_time
+                        and existing.duration_in_seconds == _PLACEHOLDER_TASK.duration_in_seconds
+                        and existing.on_monday == _PLACEHOLDER_TASK.on_monday):
+                    return  # already correct
+            await mower.set_schedule([_PLACEHOLDER_TASK])
+            logger.info("Planner: placeholder task installed in mower scheduler")
+        except Exception as e:
+            logger.warning("Planner: could not install placeholder task: %s", e)
+
+    async def _session_executor_loop(self) -> None:
+        """
+        Executor loop: watches _planned_sessions and dispatches mowing commands
+        at the right time.
+
+        For each session:
+          1. Sleep until start_dt.
+          2. Call mower_override_seconds(duration_sec) to start the session.
+          3. After duration_sec has elapsed, call mower_park_home() to return
+             the mower to HOME state between sessions.
+
+        If a session is found to already be in progress at startup (server
+        restart case), the start command is skipped and only park_home is issued
+        at the end.
+        """
+        _CHECK_S = 30          # normal polling interval (seconds)
+        _PRE_CONNECT_S = 120   # assert _needs_connection this many seconds ahead
+
         while self._stop_event and not self._stop_event.is_set():
-            # Sleep in small chunks so the stop_event is checked promptly.
+
+            # ── Smart sleep: wake earlier near upcoming events ──────────────
+            now = dt.datetime.now()
+            sleep_s = float(_CHECK_S)
+            if self._active_session:
+                end_dt = (
+                    self._active_session["start_dt"]
+                    + dt.timedelta(seconds=self._active_session["duration_sec"])
+                )
+                secs_to_end = (end_dt - now).total_seconds()
+                sleep_s = min(sleep_s, max(5.0, secs_to_end - 5))
+            else:
+                future = sorted(
+                    [s for s in self._planned_sessions if s["start_dt"] >= now],
+                    key=lambda s: s["start_dt"],
+                )
+                if future:
+                    secs = (future[0]["start_dt"] - now).total_seconds()
+                    if secs < _CHECK_S:
+                        sleep_s = max(1.0, secs)
+
             slept = 0.0
-            while slept < _RETRY_INTERVAL_S:
+            while slept < sleep_s:
                 if self._stop_event.is_set():
                     return
-                await asyncio.sleep(min(15.0, _RETRY_INTERVAL_S - slept))
-                slept += 15.0
+                chunk = min(5.0, sleep_s - slept)
+                await asyncio.sleep(chunk)
+                slept += chunk
 
-            if self._pending_tasks is None:
+            now = dt.datetime.now()
+
+            # ── Phase A: tail management for the active session ─────────────
+            if self._active_session:
+                end_dt = (
+                    self._active_session["start_dt"]
+                    + dt.timedelta(seconds=self._active_session["duration_sec"])
+                )
+                if now >= end_dt:
+                    mower = self._get_mower() if self._get_mower else None
+                    if mower and mower.is_connected():
+                        try:
+                            await mower.mower_park_home()
+                            logger.info(
+                                "Planner executor: session ended — %s %s, mower parked",
+                                self._active_session["date"],
+                                self._active_session["start_dt"].strftime("%H:%M"),
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "Planner executor: park_home after session failed: %s", e
+                            )
+                    else:
+                        logger.warning(
+                            "Planner executor: session %s ended but mower not connected "
+                            "— override will expire on its own",
+                            self._active_session["date"],
+                        )
+                    self._active_session = None
+                # Don't dispatch the next session while one is still running.
                 continue
+
+            # ── Phase B: find the next session to dispatch ──────────────────
+            if self._user_inhibited:
+                # User manually parked — skip all dispatching until resumed.
+                self._needs_connection = False
+                continue
+
+            future = sorted(
+                [s for s in self._planned_sessions
+                 if s["start_dt"] >= now - dt.timedelta(seconds=5)],
+                key=lambda s: s["start_dt"],
+            )
+            if not future:
+                self._needs_connection = False
+                continue
+
+            next_sess = future[0]
+            secs_until = (next_sess["start_dt"] - now).total_seconds()
+
+            # Update _needs_connection flag for the BLE idle-sleep logic.
+            self._needs_connection = secs_until <= _PRE_CONNECT_S
+
+            # Session is in the past (server restart while session was running).
+            if secs_until < -5:
+                end_dt = next_sess["start_dt"] + dt.timedelta(seconds=next_sess["duration_sec"])
+                if next_sess in self._planned_sessions:
+                    self._planned_sessions.remove(next_sess)
+                if now < end_dt:
+                    logger.info(
+                        "Planner executor: session %s %s is mid-run (resumed after restart)"
+                        " — will park at %s",
+                        next_sess["date"],
+                        next_sess["start_dt"].strftime("%H:%M"),
+                        end_dt.strftime("%H:%M"),
+                    )
+                    self._active_session = next_sess
+                else:
+                    logger.warning(
+                        "Planner executor: session %s %s already expired — skipping",
+                        next_sess["date"],
+                        next_sess["start_dt"].strftime("%H:%M"),
+                    )
+                continue
+
+            # Not yet time — keep sleeping.
+            if secs_until > 1.0:
+                continue
+
+            # ── Dispatch ────────────────────────────────────────────────────
+            if next_sess in self._planned_sessions:
+                self._planned_sessions.remove(next_sess)
 
             mower = self._get_mower() if self._get_mower else None
             if mower is None or not mower.is_connected():
-                continue
-
-            try:
-                activity = await mower.mower_activity()
-            except Exception as e:
-                logger.debug("Planner retry: could not read activity: %s", e)
-                continue
-
-            if activity not in _SAFE:
-                logger.debug(
-                    "Planner retry: mower is %s — not safe to push yet",
-                    activity.name if activity else "unknown",
+                logger.warning(
+                    "Planner executor: mower not connected at session start %s %s — skipping",
+                    next_sess["date"],
+                    next_sess["start_dt"].strftime("%H:%M"),
                 )
                 continue
 
-            pending_fp = _tasks_fingerprint(self._pending_tasks)
-            if pending_fp == self._last_pushed_fp:
-                # Another path already pushed an equivalent schedule.
-                self._pending_tasks = None
-                continue
-
             try:
-                current_tasks = await mower.get_all_tasks()
-                if _tasks_fingerprint(current_tasks) == pending_fp:
-                    self._last_pushed_fp = pending_fp
-                    self._pending_tasks = None
-                    logger.info("Planner retry: mower already has correct schedule")
-                else:
-                    await mower.set_schedule(self._pending_tasks)
-                    self._last_pushed_fp = pending_fp
-                    self._pending_tasks = None
-                    logger.info("Planner retry: schedule pushed to mower ✓")
+                await mower.mower_override_seconds(next_sess["duration_sec"])
+                self._active_session = next_sess
+                self._needs_connection = False
+                logger.info(
+                    "Planner executor: session started — %s %s for %d min",
+                    next_sess["date"],
+                    next_sess["start_dt"].strftime("%H:%M"),
+                    next_sess["duration_sec"] // 60,
+                )
             except Exception as e:
-                logger.warning("Planner retry push failed: %s", e)
+                logger.error(
+                    "Planner executor: failed to start session %s %s: %s",
+                    next_sess["date"],
+                    next_sess["start_dt"].strftime("%H:%M"),
+                    e,
+                )
 
     def _set_result(self, msg: str) -> str:
         self.last_result = msg
@@ -1054,6 +1628,7 @@ class PlannerAgent:
             sleep_s = self._seconds_until_next_wakeup(interval_h, replan_time)
 
             next_run = dt.datetime.now() + dt.timedelta(seconds=sleep_s)
+            self.next_run_dt = next_run
             logger.info(
                 "Planner sleeping %.0f s — next run at %s",
                 sleep_s,
@@ -1087,7 +1662,11 @@ class WeatherWatchdog:
         self._bg_task: Optional[asyncio.Task] = None
         self._stop_event: Optional[asyncio.Event] = None
         self._get_mower: Optional[Callable] = None
+        self._get_planner: Optional[Callable] = None
         self._parked_by_watchdog: bool = False
+        # Timestamp when good weather first returned after a watchdog park, used
+        # to enforce the configurable drying delay before resuming.
+        self._weather_cleared_at: Optional[dt.datetime] = None
 
         self.last_check: Optional[str] = None
         self.last_status: str = "Never checked"
@@ -1096,6 +1675,15 @@ class WeatherWatchdog:
     def set_mower_provider(self, provider: Callable) -> None:
         """Register a callable that returns the current Mower (or None)."""
         self._get_mower = provider
+
+    def set_planner_provider(self, provider: Callable) -> None:
+        """Register a callable that returns the PlannerAgent (or None).
+
+        Lets the watchdog coordinate with the session executor: respect a user
+        park (``_user_inhibited``) and resume in a schedule-aware way instead of
+        blindly clearing the override.
+        """
+        self._get_planner = provider
 
     def is_running(self) -> bool:
         return bool(self._bg_task and not self._bg_task.done())
@@ -1157,6 +1745,7 @@ class WeatherWatchdog:
         if mower is None or not mower.is_connected():
             if self._parked_by_watchdog:
                 self._parked_by_watchdog = False
+            self._weather_cleared_at = None
             return self._set_status(
                 f"Mower not connected — current weather: {desc}, "
                 f"{rain:.1f} mm/h, {wind:.1f} m/s"
@@ -1182,11 +1771,88 @@ class WeatherWatchdog:
                 # will exit HOME mode when the weather clears.
                 await mower.mower_park_home()
                 self._parked_by_watchdog = True
+                self._weather_cleared_at = None  # (re)start drying clock on next clear
                 return self._set_status(f"PARKED (HOME): {reason}")
             except Exception as e:
                 return self._set_status(f"Park command failed: {e}")
 
         elif not bad_conditions and self._parked_by_watchdog:
+            smart = bool(config.get("enabled"))
+            planner = self._get_planner() if self._get_planner else None
+
+            # Fix 3: respect a user park-for-the-day — never auto-resume against
+            # the user's explicit intent.  Just drop our flag and stay parked.
+            if smart and planner is not None and getattr(planner, "_user_inhibited", False):
+                self._parked_by_watchdog = False
+                self._weather_cleared_at = None
+                return self._set_status(
+                    f"Weather cleared but mower parked by user — not resuming ({desc})"
+                )
+
+            # ── Drying delay ────────────────────────────────────────────────
+            # Give the lawn time to dry after the weather clears before
+            # resuming.  The clock starts the first time we see good weather
+            # while parked; it is reset whenever conditions turn bad again
+            # (handled in the bad-weather branch / status branch below).
+            dry_delay_sec = max(0, int(config.get("watchdog_dry_delay_minutes", 0))) * 60
+            if dry_delay_sec > 0:
+                now = dt.datetime.now()
+                if self._weather_cleared_at is None:
+                    self._weather_cleared_at = now
+                    return self._set_status(
+                        f"Weather cleared — drying {dry_delay_sec // 60} min "
+                        f"before resume ({desc})"
+                    )
+                elapsed = (now - self._weather_cleared_at).total_seconds()
+                if elapsed < dry_delay_sec:
+                    return self._set_status(
+                        f"Drying: {int(elapsed) // 60}/{dry_delay_sec // 60} min "
+                        f"elapsed before resume ({desc})"
+                    )
+                # Drying delay satisfied — fall through to resume / replan.
+            self._weather_cleared_at = None
+
+            if smart:
+                # Fix 1 + 2: schedule-aware resume.  Only restart mowing if a
+                # planned session is still within its window; re-issue the
+                # override (mirrors the web resume handler) instead of
+                # mower_resume(), which would ClearOverride and stop the mower.
+                active = getattr(planner, "_active_session", None) if planner else None
+                if active is not None:
+                    end_dt = (
+                        active["start_dt"]
+                        + dt.timedelta(seconds=active["duration_sec"])
+                    )
+                    remaining = int((end_dt - dt.datetime.now()).total_seconds())
+                    if remaining > 0:
+                        try:
+                            await mower.mower_override_seconds(remaining)
+                            self._parked_by_watchdog = False
+                            return self._set_status(
+                                f"RESUMED active session — mowing {remaining // 60} min "
+                                f"until {end_dt.strftime('%H:%M')} ({desc})"
+                            )
+                        except Exception as e:
+                            return self._set_status(f"Resume (override) failed: {e}")
+                # No active session, or the window already ended (e.g. the drying
+                # delay outlasted it): the interrupted session is lost.  Trigger
+                # a replan so the planner can schedule a make-up session — today
+                # if a window still allows it, otherwise on the next valid day.
+                self._parked_by_watchdog = False
+                if planner is not None and hasattr(planner, "run_once"):
+                    try:
+                        await planner.run_once()
+                        return self._set_status(
+                            f"Weather cleared after drying — session window passed, "
+                            f"replanned ({desc})"
+                        )
+                    except Exception as e:
+                        return self._set_status(f"Replan after drying failed: {e}")
+                return self._set_status(
+                    f"Weather cleared — staying parked until next planned session ({desc})"
+                )
+
+            # Classic mode: return to the firmware weekly schedule.
             try:
                 await mower.mower_resume()
                 self._parked_by_watchdog = False
@@ -1201,6 +1867,10 @@ class WeatherWatchdog:
             cond = "BAD" if bad_conditions else "OK"
             parked_note = " (parked by watchdog)" if self._parked_by_watchdog else ""
             activity_name = activity.name if activity else "unknown"
+            if bad_conditions:
+                # Conditions deteriorated again before the drying delay elapsed
+                # (or mower already parked) — reset the drying clock.
+                self._weather_cleared_at = None
             return self._set_status(
                 f"Weather {cond}: {desc}, {rain:.1f} mm/h, {wind:.1f} m/s"
                 f"{parked_note} — mower: {activity_name}"

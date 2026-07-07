@@ -160,5 +160,4 @@ cython_debug/
 #.idea/
 
 # User configuration
-reconnect_config.json
-planner_config.json
+*.json

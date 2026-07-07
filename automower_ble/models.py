@@ -5,9 +5,10 @@ A list of supported Automower models
 
 # Copyright: Alistair Francis <alistair@alistair23.me>
 class ModelInformation:
-    def __init__(self, manufacturer: str, model: str):
+    def __init__(self, manufacturer: str, model: str, supports_cutting_height: bool = True):
         self.manufacturer = manufacturer
         self.model = model
+        self.supports_cutting_height = supports_cutting_height
 
 
 MowerModels = {
@@ -68,7 +69,7 @@ MowerModels = {
     (22, 2): ModelInformation("McCulloch", "Rob S600"),
     (22, 3): ModelInformation("McCulloch", "Rob Unknown (22,3)"),
     (22, 4): ModelInformation("McCulloch", "Rob S800"),
-    (23, 1): ModelInformation("Husqvarna", "Automower 305"),
+    (23, 1): ModelInformation("Husqvarna", "Automower 305", supports_cutting_height=False),
     (23, 2): ModelInformation("Husqvarna", "Automower 310 Mark II"),
     (23, 3): ModelInformation("Husqvarna", "Automower 315 Mark II"),
     (24, 1): ModelInformation("Husqvarna", "Automower Ceora 546 EPOS"),
