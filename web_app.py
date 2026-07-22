@@ -1137,10 +1137,15 @@ def _analyse_samples(samples: list[dict]) -> dict:
             drop = seg[0]["battery"] - seg[-1]["battery"]
             if drop > 0:
                 discharge_rates.append(drop / duration_h)
-            # Capture the battery % at which the mower leaves for home
+            # Capture the battery % at which the mower leaves for home.
+            # Only record when the end battery is below 40 % — this filters out
+            # segments that ended because the planner sent the mower home
+            # mid-cycle (forced park), which would otherwise inflate the
+            # return threshold with artificially high values.
             if idx + 1 < len(segments):
                 next_act = segments[idx + 1][0]
-                if next_act in (MowerActivity.GOING_HOME.value, MowerActivity.CHARGING.value):
+                if (next_act in (MowerActivity.GOING_HOME.value, MowerActivity.CHARGING.value)
+                        and seg[-1]["battery"] < 40):
                     return_thresholds.append(float(seg[-1]["battery"]))
 
         elif act == MowerActivity.CHARGING.value:
@@ -1148,10 +1153,18 @@ def _analyse_samples(samples: list[dict]) -> dict:
             if gain > 0:
                 charge_rates.append(gain / duration_h)
 
+    # Use only the most recent 5 segments for each rate so behaviour changes
+    # (new blades, seasonal variation) are reflected within a few cycles
+    # rather than being diluted by a long history of stale measurements.
+    _RECENCY = 5
+    recent_discharge = discharge_rates[-_RECENCY:]
+    recent_charge    = charge_rates[-_RECENCY:]
+    recent_threshold = return_thresholds[-_RECENCY:]
+
     return {
-        "discharge_rate_pct_per_h": round(sum(discharge_rates) / len(discharge_rates), 1) if discharge_rates else None,
-        "charge_rate_pct_per_h": round(sum(charge_rates) / len(charge_rates), 1) if charge_rates else None,
-        "return_threshold_pct": round(sum(return_thresholds) / len(return_thresholds), 1) if return_thresholds else None,
+        "discharge_rate_pct_per_h": round(sum(recent_discharge) / len(recent_discharge), 1) if recent_discharge else None,
+        "charge_rate_pct_per_h": round(sum(recent_charge) / len(recent_charge), 1) if recent_charge else None,
+        "return_threshold_pct": round(sum(recent_threshold) / len(recent_threshold), 1) if recent_threshold else None,
         "mow_segment_count": len(discharge_rates),
         "charge_segment_count": len(charge_rates),
     }
