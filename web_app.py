@@ -1834,6 +1834,51 @@ async def geocode(city: str):
     return results
 
 
+# ─── GPS location API ────────────────────────────────────────────────────────
+_GPS_TRACK_MAX = 2000          # ring-buffer cap (≈ 33 min at 1 Hz)
+_gps_track: list[dict] = []   # [{lat, lon, accuracy_m, ts}, …]
+
+
+class GpsUpdate(BaseModel):
+    lat: float
+    lon: float
+    accuracy_m: Optional[float] = None
+    ts: Optional[int] = None   # epoch seconds; defaults to server time
+
+
+@app.post("/api/gps/update")
+async def gps_update(pos: GpsUpdate):
+    """Accept a GPS fix from the on-mower controller."""
+    fix = {
+        "lat": pos.lat,
+        "lon": pos.lon,
+        "accuracy_m": pos.accuracy_m,
+        "ts": pos.ts if pos.ts is not None else int(time.time()),
+    }
+    _gps_track.append(fix)
+    if len(_gps_track) > _GPS_TRACK_MAX:
+        del _gps_track[:-_GPS_TRACK_MAX]
+    return {"status": "ok", "track_length": len(_gps_track)}
+
+
+@app.get("/api/gps/track")
+async def gps_get_track(max_points: int = 500):
+    """Return recent GPS fixes and the latest position."""
+    points = _gps_track[-max_points:] if max_points > 0 else _gps_track
+    return {
+        "current": _gps_track[-1] if _gps_track else None,
+        "track": points,
+        "total_fixes": len(_gps_track),
+    }
+
+
+@app.delete("/api/gps/track")
+async def gps_clear_track():
+    """Clear the stored GPS track."""
+    _gps_track.clear()
+    return {"status": "ok", "track_length": 0}
+
+
 # ─── Weather Watchdog API ─────────────────────────────────────────────────────
 
 @app.get("/api/watchdog/status")
