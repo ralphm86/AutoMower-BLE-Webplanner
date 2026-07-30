@@ -10,6 +10,8 @@ import bcrypt
 import pytest
 from fastapi.testclient import TestClient
 
+from automower_ble.protocol import MowerActivity
+
 
 # ─── Connection guard ─────────────────────────────────────────────────────────
 class TestConnectionGuard:
@@ -310,6 +312,134 @@ class TestRuntimeEstimate:
         r = connected_client.delete("/api/runtime_samples")
         assert r.status_code == 200
         assert r.json()["sample_count"] == 0
+
+
+# ─── GPS location and lawn coverage ───────────────────────────────────────────
+class TestGpsCoverage:
+    @staticmethod
+    def _post_fix(client, ts, lat, lon, **kw):
+        return client.post("/api/gps/update",
+                           json={"ts": ts, "lat": lat, "lon": lon, **kw})
+
+    def test_empty_track(self, client):
+        body = client.get("/api/gps/track").json()
+        assert body["current"] is None
+        assert body["track"] == []
+
+    def test_update_and_read_back(self, client):
+        r = self._post_fix(client, 1_800_000_000, 52.52, 13.405, accuracy_m=1.5)
+        assert r.status_code == 200
+        assert r.json()["track_length"] == 1
+
+        body = client.get("/api/gps/track?session=all").json()
+        assert body["current"]["lat"] == 52.52
+        assert body["current"]["accuracy_m"] == 1.5
+
+    def test_mowing_fix_creates_a_session(self, client):
+        self._post_fix(client, 1_800_000_000, 52.52, 13.405, mowing=True)
+        sessions = client.get("/api/sessions?with_coverage=true").json()["sessions"]
+        assert len(sessions) == 1
+        assert sessions[0]["active"] is True
+
+    def test_coverage_grid(self, client):
+        for i in range(4):
+            self._post_fix(client, 1_800_000_000 + i * 10,
+                           52.5200 + i * 0.000045, 13.4050, mowing=True)
+
+        body = client.get("/api/gps/coverage?session=live&cell_m=1").json()
+        assert len(body["cells"]) == 3
+        assert body["covered_m2"] == 3.0
+        assert body["bounds"] is not None
+        assert all(0.0 <= c["w"] <= 1.0 for c in body["cells"])
+
+    def test_coverage_reports_cell_size_in_degrees(self, client):
+        """The map needs this to draw true-to-scale cells instead of blobs."""
+        for i in range(2):
+            self._post_fix(client, 1_800_000_000 + i * 10,
+                           52.5200 + i * 0.000045, 13.4050, mowing=True)
+        body = client.get("/api/gps/coverage?session=live&cell_m=1").json()
+        d_lat, d_lon = body["cell_deg"]
+        assert d_lat == pytest.approx(1 / 111320.0, rel=1e-6)
+        assert d_lon > d_lat        # a degree of longitude is shorter this far north
+
+    def test_coverage_cell_size_is_validated(self, client):
+        assert client.get("/api/gps/coverage?cell_m=0").status_code == 422
+        assert client.get("/api/gps/coverage?cell_m=100").status_code == 422
+
+    def test_coverage_rejects_bad_session(self, client):
+        assert client.get("/api/gps/coverage?session=nope").status_code == 422
+
+    def test_coverage_is_empty_without_fixes(self, client):
+        body = client.get("/api/gps/coverage").json()
+        assert body["cells"] == []
+        assert body["covered_m2"] == 0.0
+
+    def test_clear_track(self, client):
+        self._post_fix(client, 1_800_000_000, 52.52, 13.405, mowing=True)
+        r = client.delete("/api/gps/track?session=all")
+        assert r.status_code == 200
+        assert r.json()["track_length"] == 0
+
+    def test_delete_unknown_session(self, client):
+        assert client.delete("/api/sessions/999").status_code == 404
+
+    def test_delete_session(self, client):
+        self._post_fix(client, 1_800_000_000, 52.52, 13.405, mowing=True)
+        sid = client.get("/api/sessions").json()["sessions"][0]["id"]
+        assert client.delete(f"/api/sessions/{sid}").status_code == 200
+        assert client.get("/api/sessions").json()["sessions"] == []
+
+
+# ─── Session history ───────────────────────────────────────────────────
+class TestSessionHistory:
+    MOW = int(MowerActivity.MOWING)
+    CHARGING = int(MowerActivity.CHARGING)
+
+    @staticmethod
+    def _tick(isolated_store, ts, activity, battery):
+        isolated_store.record_sample(ts, battery, activity, activity == int(MowerActivity.CHARGING))
+
+    def test_empty_history(self, client):
+        assert client.get("/api/sessions").json()["sessions"] == []
+
+    def test_list_reports_rollups(self, client, isolated_store):
+        t0 = 1_800_000_000
+        for i, batt in enumerate([90, 80, 70]):
+            self._tick(isolated_store, t0 + i * 60, self.MOW, batt)
+
+        s = client.get("/api/sessions").json()["sessions"][0]
+        assert s["mow_min"] == 2
+        assert s["battery_start"] == 90
+        assert s["battery_min"] == 70
+        assert s["active"] is True
+
+    def test_detail_returns_samples_and_events(self, client, isolated_store):
+        t0 = 1_800_000_000
+        self._tick(isolated_store, t0, self.MOW, 90)
+        self._tick(isolated_store, t0 + 60, self.MOW, 85)
+        self._tick(isolated_store, t0 + 120, self.CHARGING, 80)
+
+        sid = client.get("/api/sessions").json()["sessions"][0]["id"]
+        body = client.get(f"/api/sessions/{sid}").json()
+
+        assert body["session"]["id"] == sid
+        assert [s["battery"] for s in body["samples"]] == [90, 85, 80]
+        assert body["samples"][0]["activity_name"] == "MOWING"
+        # Only transitions become events, not every sample.
+        kinds = [(e["kind"], e["detail"]) for e in body["events"]]
+        assert kinds == [("activity", "MOWING"), ("activity", "CHARGING")]
+
+    def test_detail_includes_the_plan_that_caused_the_session(self, client, isolated_store):
+        t0 = 1_800_000_000
+        isolated_store.record_plan(t0, 3600, reason="grass is due", dispatched_ts=t0 - 300)
+        self._tick(isolated_store, t0, self.MOW, 90)
+
+        sid = client.get("/api/sessions").json()["sessions"][0]["id"]
+        body = client.get(f"/api/sessions/{sid}").json()
+        assert body["plan"]["reason"] == "grass is due"
+
+    def test_detail_404_for_unknown_session(self, client):
+        assert client.get("/api/sessions/999").status_code == 404
 
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────

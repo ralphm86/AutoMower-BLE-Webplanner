@@ -24,11 +24,9 @@ from planner import (
 
 # ─── Isolate file-backed state ────────────────────────────────────────────────
 @pytest.fixture
-def tmp_history(tmp_path, monkeypatch):
-    """Redirect mow-history persistence to a temp file."""
-    p = tmp_path / "mow_history.json"
-    monkeypatch.setattr(planner, "MOW_HISTORY_PATH", p)
-    return p
+def tmp_history(isolated_store):
+    """Mow history is a projection of the per-test session store."""
+    return isolated_store
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────

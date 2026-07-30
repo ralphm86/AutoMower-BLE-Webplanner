@@ -161,3 +161,8 @@ cython_debug/
 
 # User configuration
 *.json
+
+# Runtime database
+automower.db
+automower.db-wal
+automower.db-shm

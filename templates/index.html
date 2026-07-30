@@ -23,6 +23,7 @@
     .stat-value { font-size: 1.4rem; font-weight: 700; }
     .stat-label { font-size: .8rem; color: #6c757d; }
     .nav-link { cursor: pointer; }
+    .cursor-pointer { cursor: pointer; }
     .spinner-overlay { display:none; position:fixed; inset:0; background:rgba(255,255,255,.55); z-index:8888; align-items:center; justify-content:center; }
     .spinner-overlay.active { display:flex; }
     body::before {
@@ -69,6 +70,7 @@
     <li class="nav-item"><a class="nav-link" data-section="sec-messages"><i class="bi bi-journal-text me-1"></i>Messages</a></li>
     <li class="nav-item"><a class="nav-link" data-section="sec-planner"><i class="bi bi-cloud-sun me-1"></i>Planner</a></li>
     <li class="nav-item"><a class="nav-link" data-section="sec-location"><i class="bi bi-geo-alt me-1"></i>Location</a></li>
+    <li class="nav-item"><a class="nav-link" data-section="sec-history"><i class="bi bi-clock-history me-1"></i>History</a></li>
   </ul>
 
   <!-- ── CONNECT ──────────────────────────────────────────────────────────── -->
@@ -752,12 +754,42 @@
       <div class="col-12 col-xl-8">
         <div class="card">
           <div class="card-header bg-success text-white d-flex justify-content-between align-items-center">
-            <span><i class="bi bi-map me-2"></i>Live Location</span>
+            <span><i class="bi bi-map me-2"></i>Location &amp; Coverage</span>
             <div class="d-flex align-items-center gap-2">
               <span id="tab-ts-sec-location" class="text-white-50 small"></span>
               <button class="btn btn-light btn-sm" onclick="_runTabLoader('sec-location')" title="Refresh">
                 <i class="bi bi-arrow-clockwise"></i>
               </button>
+            </div>
+          </div>
+          <div class="card-body border-bottom py-2">
+            <div class="row g-2 align-items-center">
+              <div class="col-12 col-md-5">
+                <label class="form-label small text-muted mb-1" for="cov-session">Session</label>
+                <select id="cov-session" class="form-select form-select-sm" onchange="onCoverageSessionChange()">
+                  <option value="live">Live (current session)</option>
+                  <option value="all">All sessions</option>
+                </select>
+              </div>
+              <div class="col-6 col-md-3">
+                <label class="form-label small text-muted mb-1" for="cov-cell">Grid size</label>
+                <select id="cov-cell" class="form-select form-select-sm" onchange="loadCoverage()">
+                  <option value="0.5">0.5 m (RTK)</option>
+                  <option value="1" selected>1 m</option>
+                  <option value="2">2 m</option>
+                  <option value="5">5 m</option>
+                </select>
+              </div>
+              <div class="col-6 col-md-4 pt-md-4">
+                <div class="form-check form-switch mb-0">
+                  <input class="form-check-input" type="checkbox" id="cov-toggle" checked onchange="loadCoverage()">
+                  <label class="form-check-label small" for="cov-toggle">Heat map</label>
+                </div>
+                <div class="form-check form-switch mb-0">
+                  <input class="form-check-input" type="checkbox" id="cov-track-toggle" checked onchange="loadGpsTrack()">
+                  <label class="form-check-label small" for="cov-track-toggle">Track line</label>
+                </div>
+              </div>
             </div>
           </div>
           <div class="card-body p-0">
@@ -773,17 +805,76 @@
           <div class="card-body">
             <div id="gps-info-content" class="text-muted">No GPS fixes received yet.</div>
             <hr>
+            <h6 class="mt-3">Coverage</h6>
+            <dl class="row mb-0 small" id="cov-stats"><dd class="col-12 text-muted mb-0">—</dd></dl>
+            <hr>
             <h6 class="mt-3">Track</h6>
             <div id="gps-track-info" class="text-muted small">—</div>
-            <button class="btn btn-outline-danger btn-sm mt-3" onclick="clearGpsTrack()">
-              <i class="bi bi-trash me-1"></i>Clear Track
-            </button>
+            <div class="d-flex gap-2 mt-3">
+              <button class="btn btn-outline-danger btn-sm" onclick="clearGpsTrack()">
+                <i class="bi bi-trash me-1"></i>Clear Fixes
+              </button>
+              <button class="btn btn-outline-danger btn-sm" onclick="deleteGpsSession()">
+                <i class="bi bi-x-octagon me-1"></i>Delete Session
+              </button>
+            </div>
           </div>
         </div>
       </div>
 
     </div>
   </div><!-- /sec-location -->
+
+  <!-- ── SESSION HISTORY ───────────────────────────────────────────────────── -->
+  <div id="sec-history" class="section">
+    <div class="row g-3">
+
+      <!-- Session list -->
+      <div class="col-12 col-xl-5">
+        <div class="card h-100">
+          <div class="card-header bg-success text-white d-flex justify-content-between align-items-center">
+            <span><i class="bi bi-list-ul me-2"></i>Mowing Sessions</span>
+            <div class="d-flex align-items-center gap-2">
+              <span id="tab-ts-sec-history" class="text-white-50 small"></span>
+              <button class="btn btn-light btn-sm" onclick="_runTabLoader('sec-history')" title="Refresh">
+                <i class="bi bi-arrow-clockwise"></i>
+              </button>
+            </div>
+          </div>
+          <div class="card-body p-0">
+            <div class="table-responsive" style="max-height:560px; overflow-y:auto;">
+              <table class="table table-sm table-hover mb-0 align-middle">
+                <thead class="table-light sticky-top">
+                  <tr>
+                    <th>Started</th>
+                    <th class="text-end">Mow</th>
+                    <th class="text-end">Battery</th>
+                    <th class="text-end">Area</th>
+                  </tr>
+                </thead>
+                <tbody id="hist-session-rows">
+                  <tr><td colspan="4" class="text-muted text-center py-4">Loading…</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Session detail -->
+      <div class="col-12 col-xl-7">
+        <div class="card h-100">
+          <div class="card-header bg-secondary text-white">
+            <i class="bi bi-graph-up me-2"></i><span id="hist-detail-title">Session Detail</span>
+          </div>
+          <div class="card-body" id="hist-detail-body">
+            <p class="text-muted mb-0">Select a session on the left to see its battery curve and timeline.</p>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div><!-- /sec-history -->
 
   <!-- ── MESSAGES ──────────────────────────────────────────────────────────── -->
   <div id="sec-messages" class="section">
@@ -842,7 +933,8 @@ const _tabAutoLoaders = {
     await loadPlannerStatus();
     await loadWatchdogStatus();
   },
-  'sec-location': async () => { await loadGpsTrack(); },
+  'sec-location': async () => { await loadGpsSessions(); await loadGpsTrack(); await loadCoverage(); },
+  'sec-history':  async () => { await loadSessionHistory(); },
 };
 
 function _updateTabTimestamp(section) {
@@ -2303,7 +2395,9 @@ function escHtml(str) {
 let _gpsMap = null;
 let _gpsMowerMarker = null;
 let _gpsTrackLine = null;
+let _gpsHeatLayer = null;
 let _gpsMapInitialised = false;
+let _covFitDone = false;      // fit-to-bounds once per selected session
 
 function _initGpsMap(lat, lon) {
   if (_gpsMapInitialised) return;
@@ -2340,9 +2434,41 @@ function _initGpsMap(lat, lon) {
   _gpsTrackLine = L.polyline([], { color: '#dbc339', weight: 3, opacity: 0.7 }).addTo(_gpsMap);
 }
 
+function _selectedSession() {
+  return document.getElementById('cov-session')?.value || 'live';
+}
+
+function onCoverageSessionChange() {
+  _covFitDone = false;
+  _runTabLoader('sec-location');
+}
+
+async function loadGpsSessions() {
+  const sel = document.getElementById('cov-session');
+  if (!sel) return;
+  try {
+    const d = await api('GET', '/api/sessions?limit=50&with_coverage=true');
+    const keep = sel.value;
+    const opts = ['<option value="live">Live (current session)</option>',
+                  '<option value="all">All sessions</option>'];
+    for (const s of d.sessions) {
+      const started = new Date(s.started).toLocaleString();
+      const area = s.covered_m2 != null ? ` · ${Math.round(s.covered_m2)} m²` : '';
+      const flag = s.active ? ' · running' : '';
+      opts.push(`<option value="${s.id}">${escHtml(started)} · ${s.mow_min} min${area}${flag}</option>`);
+    }
+    sel.innerHTML = opts.join('');
+    // Preserve the user's selection across refreshes
+    sel.value = [...sel.options].some(o => o.value === keep) ? keep : 'live';
+  } catch (err) {
+    // Session list is non-critical — leave the static options in place.
+  }
+}
+
 async function loadGpsTrack() {
   try {
-    const d = await api('GET', '/api/gps/track?max_points=500');
+    const session = _selectedSession();
+    const d = await api('GET', `/api/gps/track?max_points=500&session=${encodeURIComponent(session)}`);
     const infoEl = document.getElementById('gps-info-content');
     const trackEl = document.getElementById('gps-track-info');
 
@@ -2368,7 +2494,8 @@ async function loadGpsTrack() {
     const pts = d.track.length;
     const first = pts > 0 ? new Date(d.track[0].ts * 1000).toLocaleTimeString() : '—';
     const last  = pts > 0 ? new Date(d.track[pts - 1].ts * 1000).toLocaleTimeString() : '—';
-    trackEl.innerHTML = `${pts} fix${pts !== 1 ? 'es' : ''} stored&nbsp;&mdash; ${first} → ${last}`;
+    trackEl.innerHTML = `${pts} fix${pts !== 1 ? 'es' : ''} shown of ${d.total_fixes}`
+      + `&nbsp;&mdash; ${first} → ${last}`;
 
     // Initialise or update the map
     _initGpsMap(c.lat, c.lon);
@@ -2378,11 +2505,12 @@ async function loadGpsTrack() {
       `Mower — ${fixTime}${accText}`
     );
 
-    const latlngs = d.track.map(p => [p.lat, p.lon]);
-    _gpsTrackLine.setLatLngs(latlngs);
+    const showTrack = document.getElementById('cov-track-toggle')?.checked !== false;
+    _gpsTrackLine.setLatLngs(showTrack ? d.track.map(p => [p.lat, p.lon]) : []);
 
-    // Pan to current position without resetting zoom
-    _gpsMap.panTo([c.lat, c.lon]);
+    // Only follow the mower on the live view; historical sessions stay put so
+    // the user can pan around without being yanked back every poll.
+    if (_selectedSession() === 'live') _gpsMap.panTo([c.lat, c.lon]);
 
     // Force Leaflet to recalculate its size in case the tab was hidden on init
     _gpsMap.invalidateSize();
@@ -2393,15 +2521,111 @@ async function loadGpsTrack() {
   }
 }
 
-async function clearGpsTrack() {
-  if (!confirm('Clear the stored GPS track?')) return;
+// Blue → red ramp matching the dwell-time weight of a coverage cell.
+function _covColor(w) {
+  const stops = [
+    [0.00, [ 44, 123, 182]],
+    [0.35, [171, 217, 233]],
+    [0.60, [255, 255, 191]],
+    [0.80, [253, 174,  97]],
+    [1.00, [215,  25,  28]],
+  ];
+  for (let i = 1; i < stops.length; i++) {
+    if (w <= stops[i][0]) {
+      const [p0, c0] = stops[i - 1], [p1, c1] = stops[i];
+      const t = (w - p0) / (p1 - p0 || 1);
+      const c = c0.map((v, j) => Math.round(v + t * (c1[j] - v)));
+      return `rgb(${c[0]},${c[1]},${c[2]})`;
+    }
+  }
+  return 'rgb(215,25,28)';
+}
+
+async function loadCoverage() {
+  const statsEl = document.getElementById('cov-stats');
+  const enabled = document.getElementById('cov-toggle')?.checked;
+
+  if (!enabled) {
+    if (_gpsHeatLayer && _gpsMap) { _gpsMap.removeLayer(_gpsHeatLayer); _gpsHeatLayer = null; }
+    statsEl.innerHTML = '<dd class="col-12 text-muted mb-0">Heat map disabled.</dd>';
+    return;
+  }
+  if (!_gpsMapInitialised) return;   // no fixes yet, nothing to draw on
+
+  const cellM = document.getElementById('cov-cell').value;
+  const session = _selectedSession();
   try {
-    await api('DELETE', '/api/gps/track');
-    _gpsTrackLine?.setLatLngs([]);
-    document.getElementById('gps-track-info').textContent = '—';
-    toast('GPS track cleared.');
+    const d = await api('GET',
+      `/api/gps/coverage?session=${encodeURIComponent(session)}&cell_m=${encodeURIComponent(cellM)}`);
+
+    if (_gpsHeatLayer) { _gpsMap.removeLayer(_gpsHeatLayer); _gpsHeatLayer = null; }
+
+    if (!d.cells.length) {
+      statsEl.innerHTML = '<dd class="col-12 text-muted mb-0">No mowing fixes for this selection.</dd>';
+      return;
+    }
+
+    // Each cell is drawn as a real-world rectangle, so a square really is
+    // cell_size_m across at every zoom level.  A canvas renderer keeps this
+    // fast even with a few thousand cells.
+    const [dLat, dLon] = d.cell_deg;
+    const renderer = L.canvas({ padding: 0.3 });
+    _gpsHeatLayer = L.layerGroup(
+      d.cells.map(c => L.rectangle(
+        [[c.lat - dLat / 2, c.lon - dLon / 2], [c.lat + dLat / 2, c.lon + dLon / 2]],
+        {
+          renderer, stroke: false, fillColor: _covColor(c.w), fillOpacity: 0.65,
+          interactive: false,
+        }
+      ))
+    ).addTo(_gpsMap);
+
+    if (!_covFitDone && d.bounds && session !== 'live') {
+      _gpsMap.fitBounds(d.bounds, { padding: [20, 20] });
+      _covFitDone = true;
+    }
+
+    statsEl.innerHTML = `
+      <dt class="col-7">Area covered</dt> <dd class="col-5">${d.covered_m2.toFixed(0)} m²</dd>
+      <dt class="col-7">Grid cells</dt>   <dd class="col-5">${d.cells.length} @ ${d.cell_size_m} m</dd>
+      <dt class="col-7">Peak dwell</dt>   <dd class="col-5">${d.peak_sec.toFixed(0)} s</dd>
+      <dt class="col-7">Mowing fixes</dt> <dd class="col-5">${d.fix_count}</dd>`;
   } catch (err) {
-    toast('Failed to clear track: ' + escHtml(err.message), 'danger');
+    statsEl.innerHTML = `<dd class="col-12 text-danger mb-0">${escHtml(err.message)}</dd>`;
+  }
+}
+
+async function clearGpsTrack() {
+  const session = _selectedSession();
+  const what = session === 'all' ? 'ALL stored GPS fixes' : 'the fixes for the selected session';
+  if (!confirm(`Clear ${what}?`)) return;
+  try {
+    await api('DELETE', `/api/gps/track?session=${encodeURIComponent(session)}`);
+    _gpsTrackLine?.setLatLngs([]);
+    if (_gpsHeatLayer && _gpsMap) { _gpsMap.removeLayer(_gpsHeatLayer); _gpsHeatLayer = null; }
+    document.getElementById('gps-track-info').textContent = '—';
+    toast('GPS fixes cleared.');
+    await _runTabLoader('sec-location');
+  } catch (err) {
+    toast('Failed to clear fixes: ' + escHtml(err.message), 'danger');
+  }
+}
+
+async function deleteGpsSession() {
+  const session = _selectedSession();
+  if (session === 'live' || session === 'all') {
+    toast('Select a specific session to delete.', 'warning');
+    return;
+  }
+  if (!confirm('Delete this session and all of its fixes and events?')) return;
+  try {
+    await api('DELETE', `/api/sessions/${encodeURIComponent(session)}`);
+    document.getElementById('cov-session').value = 'live';
+    _covFitDone = false;
+    toast('Session deleted.');
+    await _runTabLoader('sec-location');
+  } catch (err) {
+    toast('Failed to delete session: ' + escHtml(err.message), 'danger');
   }
 }
 
@@ -2410,6 +2634,170 @@ function fmtDateTime(isoStr) {
     return new Date(isoStr).toLocaleString();
   } catch {
     return isoStr;
+  }
+}
+
+// ─── Session history ──────────────────────────────────────────────────────────
+let _histSelectedId = null;
+
+function _fmtMin(min) {
+  if (!min) return '0 m';
+  const h = Math.floor(min / 60), m = min % 60;
+  return h ? `${h} h ${m} m` : `${m} m`;
+}
+
+async function loadSessionHistory() {
+  const tbody = document.getElementById('hist-session-rows');
+  try {
+    const d = await api('GET', '/api/sessions?limit=100');
+    if (!d.sessions.length) {
+      tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center py-4">'
+        + 'No mowing sessions recorded yet.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = d.sessions.map(s => {
+      const batt = (s.battery_start != null && s.battery_end != null)
+        ? `${s.battery_start}→${s.battery_end}%`
+        : (s.battery_start != null ? `${s.battery_start}%` : '—');
+      const area = s.covered_m2 != null ? `${Math.round(s.covered_m2)} m²` : '—';
+      const live = s.active ? ' <span class="badge bg-success">live</span>' : '';
+      const active = s.id === _histSelectedId ? ' table-active' : '';
+      return `<tr class="cursor-pointer${active}" onclick="showSessionDetail(${s.id})">
+        <td>${escHtml(fmtDateTime(s.started))}${live}</td>
+        <td class="text-end">${_fmtMin(s.mow_min)}</td>
+        <td class="text-end">${escHtml(batt)}</td>
+        <td class="text-end">${escHtml(area)}</td>
+      </tr>`;
+    }).join('');
+
+    // Keep the detail pane in sync with the selection across refreshes.
+    if (_histSelectedId != null) await showSessionDetail(_histSelectedId, true);
+  } catch (err) {
+    tbody.innerHTML = `<tr><td colspan="4" class="text-danger text-center py-4">`
+      + `${escHtml(err.message)}</td></tr>`;
+  }
+}
+
+// Battery percentage over the session, drawn as an inline SVG so the page
+// needs no charting dependency.
+function _batterySparkline(samples) {
+  const pts = samples.filter(s => s.battery != null);
+  if (pts.length < 2) return '<p class="text-muted small mb-0">Not enough samples for a battery curve.</p>';
+
+  const W = 560, H = 130, PAD = 24;
+  const t0 = pts[0].ts, t1 = pts[pts.length - 1].ts;
+  const span = Math.max(1, t1 - t0);
+  const x = t => PAD + (t - t0) / span * (W - 2 * PAD);
+  const y = b => H - PAD - (b / 100) * (H - 2 * PAD);
+
+  const line = pts.map((s, i) => `${i ? 'L' : 'M'}${x(s.ts).toFixed(1)},${y(s.battery).toFixed(1)}`).join(' ');
+
+  // Shade the stretches where the mower was actually cutting.
+  const bands = [];
+  let start = null;
+  for (const s of pts) {
+    const mowing = s.activity_name === 'MOWING';
+    if (mowing && start === null) start = s.ts;
+    if (!mowing && start !== null) { bands.push([start, s.ts]); start = null; }
+  }
+  if (start !== null) bands.push([start, t1]);
+  const bandSvg = bands.map(([a, b]) =>
+    `<rect x="${x(a).toFixed(1)}" y="${PAD}" width="${Math.max(1, x(b) - x(a)).toFixed(1)}" `
+    + `height="${H - 2 * PAD}" fill="#198754" opacity="0.13"/>`).join('');
+
+  const gridSvg = [0, 50, 100].map(b =>
+    `<line x1="${PAD}" y1="${y(b)}" x2="${W - PAD}" y2="${y(b)}" stroke="#dee2e6" stroke-width="1"/>`
+    + `<text x="2" y="${y(b) + 4}" font-size="10" fill="#6c757d">${b}%</text>`).join('');
+
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%; height:auto;" role="img"
+            aria-label="Battery level over the session">
+    ${bandSvg}${gridSvg}
+    <path d="${line}" fill="none" stroke="#0d6efd" stroke-width="2"/>
+    <text x="${PAD}" y="${H - 6}" font-size="10" fill="#6c757d">${escHtml(new Date(t0 * 1000).toLocaleTimeString())}</text>
+    <text x="${W - PAD}" y="${H - 6}" font-size="10" fill="#6c757d" text-anchor="end">${escHtml(new Date(t1 * 1000).toLocaleTimeString())}</text>
+  </svg>
+  <p class="text-muted small mb-0 mt-1"><span class="d-inline-block" style="width:10px;height:10px;background:#198754;opacity:.4"></span>
+   shaded = mowing</p>`;
+}
+
+const _EVENT_STYLE = {
+  activity:        'secondary',
+  error:           'danger',
+  command:         'primary',
+  connect:         'success',
+  disconnect:      'dark',
+  watchdog_park:   'warning',
+  watchdog_resume: 'info',
+};
+
+function _eventTimeline(events) {
+  if (!events.length) return '<p class="text-muted small mb-0">No events recorded.</p>';
+  return '<ul class="list-group list-group-flush small">' + events.map(e => {
+    const colour = _EVENT_STYLE[e.kind] || 'secondary';
+    return `<li class="list-group-item px-0 py-1 d-flex gap-2 align-items-center">
+      <span class="text-muted" style="min-width:70px">${escHtml(new Date(e.ts * 1000).toLocaleTimeString())}</span>
+      <span class="badge bg-${colour}">${escHtml(e.kind)}</span>
+      <span>${escHtml(e.detail || '')}</span>
+    </li>`;
+  }).join('') + '</ul>';
+}
+
+async function showSessionDetail(id, quiet = false) {
+  _histSelectedId = id;
+  const titleEl = document.getElementById('hist-detail-title');
+  const bodyEl = document.getElementById('hist-detail-body');
+  if (!quiet) bodyEl.innerHTML = '<p class="text-muted mb-0">Loading…</p>';
+  try {
+    const d = await api('GET', `/api/sessions/${id}`);
+    const s = d.session;
+    titleEl.textContent = `Session ${id} — ${fmtDateTime(s.started)}`;
+
+    const planRow = d.plan
+      ? `<dt class="col-5">Planned because</dt><dd class="col-7">${escHtml(d.plan.reason || '—')}</dd>`
+      : '';
+    const covRow = s.covered_m2 != null
+      ? `<dt class="col-5">Area covered</dt><dd class="col-7">${Math.round(s.covered_m2)} m² (${s.fix_count} fixes)</dd>`
+      : '';
+
+    bodyEl.innerHTML = `
+      <dl class="row small mb-3">
+        <dt class="col-5">Started</dt>    <dd class="col-7">${escHtml(fmtDateTime(s.started))}</dd>
+        <dt class="col-5">Ended</dt>      <dd class="col-7">${s.ended ? escHtml(fmtDateTime(s.ended)) : '<span class="badge bg-success">still running</span>'}</dd>
+        <dt class="col-5">Elapsed</dt>    <dd class="col-7">${_fmtMin(s.elapsed_min)}</dd>
+        <dt class="col-5">Mowing</dt>     <dd class="col-7">${_fmtMin(s.mow_min)}</dd>
+        <dt class="col-5">Charging</dt>   <dd class="col-7">${_fmtMin(s.charge_min)}</dd>
+        <dt class="col-5">Searching</dt>  <dd class="col-7">${_fmtMin(s.search_min)}</dd>
+        <dt class="col-5">Battery</dt>    <dd class="col-7">${s.battery_start ?? '—'}% → ${s.battery_end ?? '—'}% (min ${s.battery_min ?? '—'}%)</dd>
+        ${covRow}
+        ${planRow}
+        <dt class="col-5">Ended by</dt>   <dd class="col-7">${escHtml(s.end_reason || '—')} <span class="text-muted">(${escHtml(s.source)})</span></dd>
+      </dl>
+      <h6>Battery</h6>
+      ${_batterySparkline(d.samples)}
+      <h6 class="mt-3">Timeline</h6>
+      ${_eventTimeline(d.events)}
+      <div class="mt-3">
+        <button class="btn btn-outline-danger btn-sm" onclick="deleteHistorySession(${id})">
+          <i class="bi bi-trash me-1"></i>Delete Session
+        </button>
+      </div>`;
+  } catch (err) {
+    bodyEl.innerHTML = `<p class="text-danger mb-0">${escHtml(err.message)}</p>`;
+  }
+}
+
+async function deleteHistorySession(id) {
+  if (!confirm('Delete this session and all of its fixes and events?')) return;
+  try {
+    await api('DELETE', `/api/sessions/${id}`);
+    _histSelectedId = null;
+    document.getElementById('hist-detail-title').textContent = 'Session Detail';
+    document.getElementById('hist-detail-body').innerHTML =
+      '<p class="text-muted mb-0">Select a session on the left to see its battery curve and timeline.</p>';
+    toast('Session deleted.');
+    await _runTabLoader('sec-history');
+  } catch (err) {
+    toast('Failed to delete session: ' + escHtml(err.message), 'danger');
   }
 }
 </script>

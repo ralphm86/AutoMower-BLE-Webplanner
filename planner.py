@@ -23,14 +23,13 @@ import urllib.parse
 import urllib.error
 
 from automower_ble.protocol import TaskInformation, MowerActivity
+import store
 
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path("planner_config.json")
-MOW_HISTORY_PATH = Path("mow_history.json")
 PLANNED_SESSIONS_PATH = Path("planned_sessions.json")
 PLAN_LOG_PATH = Path("plan_log.json")
-_MOW_HISTORY_RETAIN_DAYS = 90
 
 # Placeholder task installed in the mower's firmware scheduler when the
 # direct-command planner is active.  The firmware requires at least one task
@@ -172,25 +171,21 @@ def save_config(config: dict) -> None:
 # Tracks actual mowing dates/durations so the planner seeds the interval
 # constraint from reality (not from the schedule, which may differ when the
 # mower was parked by weather, manual override, or a missed session).
+#
+# The data now lives in the session store; these wrappers preserve the original
+# call signatures so the planner's logic is unaffected by that move.
+
+def _log_event(kind: str, detail: str = "") -> None:
+    """Append a timeline event without letting bookkeeping break the caller."""
+    try:
+        store.record_event(kind, detail)
+    except Exception as exc:
+        logger.debug("Event log failed (ignored): %s", exc)
+
 
 def load_mow_history() -> dict:
-    """Load {date_str: {mow_sec, complete, last_updated}} from disk."""
-    if MOW_HISTORY_PATH.exists():
-        try:
-            return json.loads(MOW_HISTORY_PATH.read_text())
-        except Exception as e:
-            logger.warning("Could not load mow history: %s", e)
-    return {}
-
-
-def save_mow_history(history: dict) -> None:
-    """Persist mow history, pruning entries older than _MOW_HISTORY_RETAIN_DAYS."""
-    cutoff = (dt.date.today() - dt.timedelta(days=_MOW_HISTORY_RETAIN_DAYS)).isoformat()
-    history = {d: v for d, v in history.items() if d >= cutoff}
-    try:
-        MOW_HISTORY_PATH.write_text(json.dumps(history, indent=2, default=str))
-    except Exception as e:
-        logger.warning("Could not save mow history: %s", e)
+    """Return {date_str: {mow_sec, complete, last_updated}} derived from sessions."""
+    return store.load_mow_history()
 
 
 def record_mowing_day(
@@ -199,26 +194,11 @@ def record_mowing_day(
     complete: bool = True,
 ) -> None:
     """
-    Accumulate *mow_sec* of actual mowing time for *date* in the persistent
-    history.  Multiple calls for the same date are additive so a day with
-    two separate runs (or sampler restarts) accumulates the correct total.
+    Accumulate *mow_sec* of actual mowing time for *date*.  Multiple calls for
+    the same date are additive so a day with two separate runs (or sampler
+    restarts) accumulates the correct total.
     """
-    if mow_sec <= 0:
-        return
-    history = load_mow_history()
-    date_str = date.isoformat()
-    existing = history.get(date_str, {"mow_sec": 0})
-    new_total = existing["mow_sec"] + mow_sec
-    history[date_str] = {
-        "mow_sec": new_total,
-        "complete": complete,
-        "last_updated": dt.datetime.now().isoformat(timespec="seconds"),
-    }
-    save_mow_history(history)
-    logger.debug(
-        "Mow history: %s += %ds \u2192 total %ds (complete=%s)",
-        date_str, mow_sec, new_total, complete,
-    )
+    store.record_mowing_day(date, mow_sec, complete=complete)
 
 
 def get_last_mow_date(days_back: int = 60) -> Optional[dt.date]:
@@ -226,19 +206,12 @@ def get_last_mow_date(days_back: int = 60) -> Optional[dt.date]:
     Return the most recent date within *days_back* days that has recorded
     mowing activity.  Returns None when no history is available.
     """
-    history = load_mow_history()
-    today = dt.date.today()
-    for back in range(1, days_back + 1):
-        candidate = today - dt.timedelta(days=back)
-        if candidate.isoformat() in history:
-            return candidate
-    return None
+    return store.get_last_mow_date(days_back)
 
 
 def get_mow_sec_today() -> int:
-    """Return total recorded (completed) mowing seconds for today."""
-    history = load_mow_history()
-    return int(history.get(dt.date.today().isoformat(), {}).get("mow_sec", 0))
+    """Return total mowing seconds recorded for today."""
+    return store.get_mow_sec_today()
 
 
 # ─── Weather fetching (Open-Meteo — free, no API key) ────────────────────────
@@ -730,7 +703,7 @@ def plan_schedule(
     dicts for display.
 
     *seeded_last_mow_date* is the most-recent past date with recorded actual
-    mowing (from mow_history.json, not schedule-derived).  When provided it is
+    mowing (from the session store, not schedule-derived).  When provided it is
     used as the initial ``last_mow_date`` so the interval constraint is
     correctly enforced across replans even when sessions were missed.
 
@@ -1044,13 +1017,14 @@ def plan_schedule(
             continue
 
         # ✓ Record as absolute-datetime sessions
-        for (start_s, sess_s, _) in day_sessions:
+        for (start_s, sess_s, sess_reason) in day_sessions:
             start_dt = dt.datetime.combine(date, dt.time(0, 0)) + dt.timedelta(seconds=start_s)
             sessions.append({
                 "start_dt": start_dt,
                 "duration_sec": sess_s,
                 "date": date.isoformat(),
                 "dow_name": DAY_NAMES[dow],
+                "reason": sess_reason,
             })
         last_mow_date = date
 
@@ -1146,8 +1120,8 @@ class PlannerAgent:
     def set_mow_today_provider(self, provider: Callable) -> None:
         """
         Register a callable that returns the total mowing seconds for today
-        (completed sessions in mow_history.json + any ongoing session tracked
-        by the sampler).  Used by run_once() to deduct progress from today's
+        (every session recorded for today, including one still in progress).
+        Used by run_once() to deduct progress from today's
         target before building the schedule.
         """
         self._mow_today_provider = provider
@@ -1492,6 +1466,11 @@ class PlannerAgent:
                             "— override will expire on its own",
                             self._active_session["date"],
                         )
+                    if self._active_session.get("plan_id"):
+                        try:
+                            store.set_plan_outcome(self._active_session["plan_id"], "completed")
+                        except Exception as exc:
+                            logger.debug("Plan outcome update failed (ignored): %s", exc)
                     self._active_session = None
                 # Don't dispatch the next session while one is still running.
                 continue
@@ -1560,6 +1539,17 @@ class PlannerAgent:
                 await mower.mower_override_seconds(next_sess["duration_sec"])
                 self._active_session = next_sess
                 self._needs_connection = False
+                # Record why the mower went out so the session history can trace
+                # each mow back to the decision that caused it.  open_session()
+                # claims this plan when the sampler first sees MOWING.
+                try:
+                    next_sess["plan_id"] = store.record_plan(
+                        start_ts=int(next_sess["start_dt"].timestamp()),
+                        duration_sec=next_sess["duration_sec"],
+                        reason=next_sess.get("reason"),
+                    )
+                except Exception as exc:
+                    logger.debug("Plan record failed (ignored): %s", exc)
                 logger.info(
                     "Planner executor: session started — %s %s for %d min",
                     next_sess["date"],
@@ -1772,6 +1762,7 @@ class WeatherWatchdog:
                 await mower.mower_park_home()
                 self._parked_by_watchdog = True
                 self._weather_cleared_at = None  # (re)start drying clock on next clear
+                _log_event("watchdog_park", reason)
                 return self._set_status(f"PARKED (HOME): {reason}")
             except Exception as e:
                 return self._set_status(f"Park command failed: {e}")
@@ -1828,6 +1819,7 @@ class WeatherWatchdog:
                         try:
                             await mower.mower_override_seconds(remaining)
                             self._parked_by_watchdog = False
+                            _log_event("watchdog_resume", desc)
                             return self._set_status(
                                 f"RESUMED active session — mowing {remaining // 60} min "
                                 f"until {end_dt.strftime('%H:%M')} ({desc})"
