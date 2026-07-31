@@ -392,6 +392,7 @@ async def _reconnect_loop() -> None:
     global _mower, _connected
     _SCAN_TIMEOUT = 8.0
     _RETRY_INTERVAL = 30.0
+    _RETRY_INTERVAL_URGENT = 5.0
     _first = True  # skip initial sleep; attempt connection immediately on startup
 
     while True:
@@ -399,7 +400,12 @@ async def _reconnect_loop() -> None:
             _first = False
             logger.info("Auto-reconnect: startup — attempting immediate connect")
         else:
-            await asyncio.sleep(_RETRY_INTERVAL)
+            interval = (
+                _RETRY_INTERVAL_URGENT
+                if planner._needs_connection
+                else _RETRY_INTERVAL
+            )
+            await asyncio.sleep(interval)
 
         try:
             if not _reconnect_enabled or not _reconnect_cfg:

@@ -1432,7 +1432,7 @@ class PlannerAgent:
         at the end.
         """
         _CHECK_S = 30          # normal polling interval (seconds)
-        _PRE_CONNECT_S = 120   # assert _needs_connection this many seconds ahead
+        _PRE_CONNECT_S = 300   # assert _needs_connection this many seconds ahead
 
         while self._stop_event and not self._stop_event.is_set():
 
@@ -1549,8 +1549,27 @@ class PlannerAgent:
 
             mower = self._get_mower() if self._get_mower else None
             if mower is None or not mower.is_connected():
+                grace_connect_deadline = next_sess["start_dt"] + dt.timedelta(seconds=30)
                 logger.warning(
-                    "Planner executor: mower not connected at session start %s %s — skipping",
+                    "Planner executor: mower not connected at session start %s %s — waiting up to 30s for reconnect",
+                    next_sess["date"],
+                    next_sess["start_dt"].strftime("%H:%M"),
+                )
+                while dt.datetime.now() < grace_connect_deadline:
+                    await asyncio.sleep(1)
+                    mower = self._get_mower() if self._get_mower else None
+                    if mower is not None and mower.is_connected():
+                        logger.info(
+                            "Planner executor: mower reconnected in grace window for session %s %s",
+                            next_sess["date"],
+                            next_sess["start_dt"].strftime("%H:%M"),
+                        )
+                        break
+
+            mower = self._get_mower() if self._get_mower else None
+            if mower is None or not mower.is_connected():
+                logger.warning(
+                    "Planner executor: mower still not connected at session start %s %s — skipping",
                     next_sess["date"],
                     next_sess["start_dt"].strftime("%H:%M"),
                 )
@@ -1604,6 +1623,7 @@ class PlannerAgent:
 
     async def _loop(self) -> None:
         """Background loop: plan, then sleep until the next scheduled wakeup."""
+        _RETRY_INTERVAL_FETCH_FAIL = 300
         # Wait for the startup reconnect attempt to complete so the first
         # run_once() can actually push to the mower immediately.
         if self._startup_event is not None:
@@ -1626,6 +1646,17 @@ class PlannerAgent:
             interval_h = max(0.1, float(config.get("replan_interval_hours", 6)))
             replan_time = config.get("replan_time", "")
             sleep_s = self._seconds_until_next_wakeup(interval_h, replan_time)
+
+            # On weather fetch failure, retry sooner so the planner can recover
+            # within the same night rather than waiting for the next scheduled run.
+            if self.last_result and self.last_result.startswith("Weather fetch failed:"):
+                retry_s = _RETRY_INTERVAL_FETCH_FAIL
+                sleep_s = min(sleep_s, retry_s)
+                logger.info(
+                    "Planner weather fetch failed — retrying in %.0f s instead of %.0f s",
+                    sleep_s,
+                    max(retry_s, sleep_s),
+                )
 
             next_run = dt.datetime.now() + dt.timedelta(seconds=sleep_s)
             self.next_run_dt = next_run
