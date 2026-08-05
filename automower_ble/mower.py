@@ -299,6 +299,12 @@ class Mower(BLEClient):
             task["useOnSaturday"],
             task["useOnSunday"],
         )
+    
+    async def cmd_reset_blade_time(self):
+        """
+        Reset the cutting blade usage time counter.
+        """
+        await self.command("ResetCuttingBladeUsageTime")
 
 
 async def main(mower: Mower):

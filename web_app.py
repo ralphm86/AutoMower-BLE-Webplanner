@@ -1099,6 +1099,18 @@ async def get_statistics():
         "override": override_info,
     }
 
+@app.post("/api/command/reset_blade_usage")
+async def command_reset_blade_usage():
+    """
+    Reset the Blade Usage Timer. Useful if the blades have been changed.
+
+    """
+    _require_connection()
+    logger.info("Reset the Blade Usage Timer")
+    await _mower.cmd_reset_blade_time()
+    msg = "Blade Usage Timer reset."
+    return {"status": "ok", "action": "reset_blade_usage", "message": msg}
+
 
 # ─── Runtime estimation helpers ───────────────────────────────────────────────
 _MIN_SEG_SAMPLES = 3      # minimum samples to qualify a segment

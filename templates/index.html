@@ -1435,7 +1435,7 @@ async function loadStats() {
         ${statCard('bi-search', 'Searching', s.total_searching_hours + ' h', 'info')}
         ${statCard('bi-exclamation-triangle', 'Collisions', s.number_of_collisions, 'danger')}
         ${statCard('bi-battery-charging', 'Charge Cycles', s.number_of_charging_cycles, 'primary')}
-        ${statCard('bi-tools', 'Blade Usage', s.cutting_blade_usage_hours + ' h', bladeColor)}
+        ${statCard('bi-tools', 'Blade Usage', s.cutting_blade_usage_hours + ' h', bladeColor, '<button class="btn btn-sm btn-outline-danger" onclick="resetBladeUsageTimer()" title="Reset blade usage hours on mower"><i class="bi bi-arrow-counterclockwise"></i> Reset Blase Usage Timer</button>')}
       </div>
       <h6 class="text-muted mb-2">Efficiency &amp; Health</h6>
       <div class="row g-3 mb-3">
@@ -1451,7 +1451,7 @@ async function loadStats() {
   }
 }
 
-function statCard(icon, label, value, color) {
+function statCard(icon, label, value, color, extraHtml='') {
   return `
     <div class="col-6 col-md-4 col-lg-3">
       <div class="card text-center">
@@ -1459,6 +1459,7 @@ function statCard(icon, label, value, color) {
           <i class="bi ${icon} fs-3 text-${color}"></i>
           <div class="stat-value mt-1">${value}</div>
           <div class="stat-label">${label}</div>
+          ${extraHtml ? `<div class="mt-2">${extraHtml}</div>` : ''}
         </div>
       </div>
     </div>`;
@@ -1624,6 +1625,23 @@ async function clearRuntimeSamples() {
   } catch (ex) {
     hideSpinner();
     toast('Failed to clear samples: ' + ex.message, 'danger');
+  }
+}
+
+async function resetBladeUsageTimer() {
+  if (!confirm('Clear Blade Usage Timer. Only recommended if new blades were installed.')) return;
+  const el = document.getElementById('stats-result');
+  try {
+    showSpinner();
+    const data = await api('POST', '/api/command/reset_blade_usage', null);
+    hideSpinner();
+    if (el) {
+      el.innerHTML = `<div class="alert alert-success">✔ ${escHtml(data.message)}</div>`;
+    }
+    toast(data.message, 'success');
+  } catch (ex) {
+    hideSpinner();
+    toast('Failed to reset Blade Usage Timer: ' + ex.message, 'danger');
   }
 }
 
