@@ -1,89 +1,193 @@
-# AutoMower-BLE
+<p align="center">
+  <img src="logo.jpeg" alt="Sir Schnittalot – Ritter des Rasens" width="260">
+</p>
 
-An unofficial, reverse-engineered Husqvarna Automower BLE library with a full-featured local web interface. Control your mower, manage its schedule, and let a weather-aware planning agent keep the lawn cut — all without any cloud account or internet dependency (except optional weather data).
+<h1 align="center">Sir Schnittalot</h1>
 
-<noscript><a href="https://liberapay.com/alistair23/donate"><img alt="Donate using Liberapay" src="https://liberapay.com/assets/widgets/donate.svg"></a></noscript>
+<p align="center">
+  <em>Ritter des Rasens — the knight of the lawn</em><br>
+  <strong>A weather-aware, growth-adaptive mowing planner and local web UI for Husqvarna Automowers — over Bluetooth, no cloud.</strong>
+</p>
+
+<p align="center">
+  <img src="docs/images/planner-overview.png" alt="Planner tab: planner status, lawn growth model, weather watchdog and planning log" width="900">
+</p>
+
+**Sir Schnittalot** is an unofficial, reverse-engineered Husqvarna Automower BLE library with a full-featured local web interface. Instead of a fixed weekly calendar, a planning agent reads the weather forecast, estimates how fast the lawn is growing and tells the mower **when** and **how long** to mow — all without any cloud account (the only internet access is the free Open-Meteo weather API).
 
 Developed and tested against an **Automower 305**. Should work on all Automowers; reports for other models are welcome.
 
+> The repository, the Python package (`automower_ble`) and the CLI tools keep the technical name **AutoMower-BLE**.
+
 Details on the reverse-engineering process: https://www.alistair23.me/2024/01/06/reverse-engineering-automower-ble
+
+**Credit:** the BLE protocol and command library (`automower_ble/`) builds on the reverse-engineering work and the original [AutoMower-BLE](https://github.com/alistair23/AutoMower-BLE) library by [Alistair Francis (alistair23)](https://github.com/alistair23). See [Credits](#credits).
+
+> The screenshots in this README are generated from synthetic demo data (see [Regenerating the screenshots](#regenerating-the-screenshots)).
+
+**Contents:** [Highlights](#highlights) · [Web UI tour](#web-ui-tour) · [The Web Planner](#the-web-planner) · [Installation](#installation) · [Authentication](#authentication) · [Configuration](#configuration-files) · [CLI / library](#cli--library-usage) · [Architecture](#architecture) · [Developer notes](#developer-notes)
 
 ---
 
-## System Overview
+## Highlights
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                  AutoMower-BLE Stack                    │
-│                                                         │
-│  Browser  ──HTTP──►  web_app.py  (FastAPI / uvicorn)   │
-│                           │                             │
-│        ┌──────────────────┼──────────────────┐          │
-│        │                  │                  │          │
-│   planner.py         automower_ble/    background loops │
-│  PlannerAgent +       mower.py         (reconnect /     │
-│  WeatherWatchdog      protocol.py       sampler /       │
-│        │              protocol.json     idle-sleep)     │
-│        │                  │                  │          │
-│  Open-Meteo API       BLE (bleak) ◄──────────┘          │
-│  (forecast +              │                             │
-│   current wx)             │                             │
-│                    Husqvarna Automower                  │
-└─────────────────────────────────────────────────────────┘
-```
+- **Weather-aware planning** — hourly forecasts from [Open-Meteo](https://open-meteo.com) (free, no API key) decide the best mowing slots for the next 7 days: rain, wind and temperature thresholds, post-rain delay.
+- **Adaptive, growth-based mowing** — an optional lawn growth model (temperature × soil water) replaces "X hours every N days" with a mowing backlog: mow more when the grass races, hardly at all in a drought. See [Adaptive Mowing](#adaptive-mowing).
+- **Wildlife- and lawn-friendly** — hedgehog protection (daylight only), dew avoidance, and heat-stress protection (midday no-mow window).
+- **Cycle-aware sizing** — windows are inflated so the actual cutting time hits the target despite charging breaks.
+- **Planner executor + weather watchdog** — sessions are dispatched to the mower at the right time; if a thunderstorm or threshold breach shows up mid-session the mower is parked and resumed automatically (optionally after a drying delay, with a make-up session replanned if needed).
+- **Full manual control** — status, commands, schedule editor, statistics and message log in one Bootstrap 5 single-page UI, with Smart and Classic [control modes](#control-modes).
+- **Robust BLE** — auto-reconnect, fragmented/duplicate notification handling, idle sleep, clock sync, flash wear protection.
+- **Runs anywhere** — a laptop for development, a Raspberry Pi Zero 2 W as a headless always-on server, optional password login.
 
-### Components
+---
 
-| File / Package | Role |
+## Web UI tour
+
+The UI is a single page with seven tabs: **Connect**, **Status**, **Commands**, **Schedule**, **Statistics**, **Messages** and **Planner**. Each tab loads fresh data when opened (while connected).
+
+| Tab | What it does |
 |---|---|
-| `automower_ble/protocol.json` | Reverse-engineered BLE command definitions (major/minor IDs, request & response field types) |
-| `automower_ble/protocol.py` | Low-level BLE client: packet encoding/decoding, CRC, connection handshake, and resilient frame reassembly (handles fragmented, duplicated, and out-of-order notifications) |
-| `automower_ble/mower.py` | High-level mower API: `connect`, `set_schedule`, `mower_park`, `set_time`, etc. |
-| `automower_ble/models.py` | Mapping of `(deviceType, deviceVariant)` codes to human-readable model names |
-| `automower_ble/error_codes.py` | Enumeration of mower error / message codes |
-| `automower_ble/helpers.py` | Shared encoding/CRC helpers |
-| `web_app.py` | FastAPI web server — REST API + HTML page serving. Manages connection state, auto-reconnect, BLE idle sleep, time sync, runtime sampling |
-| `planner.py` | Weather-based planning agent (`PlannerAgent`) and real-time watchdog (`WeatherWatchdog`) |
-| `growth.py` | Lawn growth model (growth index from temperature and a soil-water bucket) and mowing backlog used by adaptive mowing |
-| `templates/index.html` | Single-page Bootstrap 5 UI (7 tabs: Connect, Status, Commands, Schedule, Statistics, Messages, Planner) |
-| `templates/login.html` | Password login page (shown when authentication is enabled) |
-| `ble_scanner.py` | Standalone CLI scanner that lists nearby Husqvarna BLE devices |
-| `mower_test_cli.py` | Interactive CLI for exercising mower commands without the web app |
-| `tests/` | `pytest` suite — BLE protocol, web API, planner logic, weather-watchdog coordination, and Playwright UI tests |
-| `planner_config.json` | Persisted planner settings (location, windows, thresholds, protections, watchdog) |
-| `reconnect_config.json` | Persisted BLE address, channel ID, PIN, and auto-reconnect flag |
-| `runtime_samples.json` | Rolling battery/activity samples used by the runtime estimator |
-| `mow_history.json` | Actual recorded mowing time per day (seeds the planner's interval constraint and adaptive-mowing backlog) |
-| `planned_sessions.json` | Upcoming planned mowing sessions dispatched by the planner's executor |
-| `plan_log.json` | Per-day decision log from the last planning run (shown in the Planner tab) |
+| **Connect** | Scan for nearby Husqvarna devices, connect/pair (optional PIN), auto-reconnect toggle |
+| **Status** | Identity, state, activity, battery, errors, and (in Smart mode) the live session context |
+| **Commands** | Mow, pause, park, resume, cutting height, clock sync, … |
+| **Schedule** | Read, edit and push the firmware's weekly schedule (locked while the planner owns it) |
+| **Statistics** | Lifetime usage, blade usage and the [runtime estimator](#runtime-estimator) |
+| **Messages** | Mower message / error log |
+| **Planner** | Everything about automatic planning — settings, planning log, lawn growth, forecast, watchdog |
 
-### Key Features
+### Status
 
-- **BLE pairing & control** — scan, connect, pair (with optional PIN), send all standard commands
-- **Smart vs Classic control mode** — when the planner is enabled the app runs in **Smart** mode (commands cooperate with the planner's executor and session tracking); otherwise **Classic** mode issues raw firmware commands. See [Control Modes](#control-modes) below.
-- **Schedule editor** — read the current 7-day schedule, edit it visually, push it back to the mower (locked while the planner owns the schedule)
-- **Auto-reconnect** — background loop re-connects automatically after a dropout, recovering from BlueZ "zombie" links. The protocol layer reassembles fragmented BLE notifications, drops the firmware's duplicate-notification floods, and skips unsolicited frames so a reconnect mid-mow recovers cleanly
-- **BLE idle sleep** — disconnects automatically when the web UI is idle and the mower is parked, then reconnects on the next request or upcoming planned session, to save energy
-- **Clock sync** — mower clock synced to local time on every connect
-- **Weather planner** — fetches hourly forecasts from [Open-Meteo](https://open-meteo.com) (free, no API key) and computes optimal mowing slots respecting:
-  - per-day-of-week available time windows and target mowing hours
-  - minimum interval between mowing days
-  - per-session min/max duration
-  - rain, wind speed, temperature, and post-rain delay thresholds
-  - **hedgehog protection** (daylight-only mowing, sunrise→sunset)
-  - **heat-stress protection** (midday no-mow window + reduced frequency on hot days; with [adaptive mowing](#adaptive-mowing) only the no-mow window applies)
-  - **dew avoidance** (delay start until dew has evaporated, auto-estimated or fixed)
-  - **cycle-aware sizing** (inflates the window so actual cutting time hits the target despite charging breaks)
-  - **adaptive mowing** (optional: frequency and duration follow estimated lawn growth instead of a fixed interval/target — see [Adaptive Mowing](#adaptive-mowing))
-- **Planner executor** — dispatches the computed sessions to the mower at the right time via direct override commands, deducting already-completed mowing from the daily target
-- **City geocoding** — resolve a city name to coordinates via Open-Meteo for the planner location
-- **Weather watchdog** — polls *current* conditions every N minutes; parks the mower (HOME mode) if a thunderstorm or threshold breach is detected mid-session, resumes automatically when conditions clear. An optional **drying delay** holds the resume for a configurable time after the weather clears so the lawn can dry; if that delay outlasts the interrupted session's window, the planner replans a make-up session (today if a window still allows it, otherwise the next valid day)
-- **Runtime estimator** — samples battery level and activity every minute; derives discharge/charge rates and estimates mowing vs charging breakdown for a planned session
-- **Mow history** — records actual mowing time per day so the planner's interval logic reflects reality even after missed or weather-cancelled sessions
-- **Password authentication** — optional session-cookie login page (bcrypt + signed cookie); enabled with `--password` or the `AUTH_PASSWORD` env var
-- **Rotating file logging** — optional `--log-file` with size-based rotation for multi-day diagnostics
-- **Flash wear protection** — schedule is only written to the mower when it actually changes
-- **Auto-load on tab switch** — each tab automatically fetches fresh data when opened (while connected)
+<p align="center">
+  <img src="docs/images/status.png" alt="Status tab showing a mowing Automower 305 in Smart mode" width="800">
+</p>
+
+### Planner
+
+The Planner tab is the heart of the app. Settings are at the top; the live state is below.
+
+#### General settings and mowing windows
+
+<p align="center">
+  <img src="docs/images/planner-general.png" alt="Planner general settings and available mowing windows" width="800">
+</p>
+
+- **Enable Auto-Planning** — switches the app between [Smart and Classic mode](#control-modes).
+- **Location** — type a city and press **Find** (Open-Meteo geocoding) or enter latitude/longitude directly. It drives the forecast and the sunrise/sunset times used for hedgehog protection and dew estimation.
+- **Auto-Replan Interval** — the planner reruns every *N* hours and/or at a fixed time of day, whichever comes first.
+- **Available Mowing Windows** — the times of day (per weekday) in which the mower may work; times are local and **+ Add** creates a new row. The planner only places sessions inside these windows, so they are the outer frame for everything else.
+
+#### Mowing parameters, thresholds and protections
+
+<p align="center">
+  <img src="docs/images/planner-settings.png" alt="Planner settings: mowing parameters, adaptive mowing, weather thresholds, hedgehog, heat stress, dew and watchdog" width="800">
+</p>
+
+Below the settings, **Run Now** recomputes the plan and the panels show the result: the next session, the **Lawn Growth** model, the **Weather Watchdog**, a day-by-day **Planning Log** (with a toggle to the recorded **mow history**), and finally the hourly forecast the plan is based on — daylight, hedgehog hours and dew phases are greyed out.
+
+<p align="center">
+  <img src="docs/images/planner-forecast.png" alt="Last fetched hourly forecast with hedgehog and dew phases greyed out" width="800">
+</p>
+
+---
+
+## The Web Planner
+
+### How it works
+
+```mermaid
+flowchart LR
+    W[Open-Meteo<br/>forecast + 14 past days] --> G[Growth model<br/>temperature x soil water]
+    W --> P
+    G --> B[Mowing backlog]
+    H[mow_history.json<br/>actual mowing] --> B
+    B --> P[Planner<br/>windows, thresholds,<br/>hedgehog, heat, dew]
+    P --> S[planned_sessions.json]
+    S --> E[Executor<br/>override commands]
+    E --> M[(Automower)]
+    D[Weather watchdog<br/>current conditions] -- park / resume --> M
+```
+
+Each planner run (every *N* hours and/or at a fixed time of day, or on demand with **Run Now**) fetches the forecast, decides day by day whether and when to mow inside your configured time windows, writes the sessions to `planned_sessions.json` and the per-day decisions to `plan_log.json`. The executor then starts and stops the mower for each session.
+
+### Planning rules
+
+The planner respects:
+
+- per-day-of-week available **time windows** (Planner tab → *Available Mowing Windows*) and the target mowing hours
+- minimum **interval** between mowing days
+- per-session **min/max duration**
+- **rain, wind speed, temperature** and post-rain delay thresholds
+- **cycle-aware sizing** (charging breaks are accounted for)
+- **adaptive mowing** (optional, replaces the fixed interval/target — see below)
+
+#### Protections
+
+| Protection | What it does |
+|---|---|
+| **Hedgehog protection** | Daylight-only mowing (sunrise → sunset, calculated from your location) |
+| **Heat-stress protection** | Avoids the hottest midday hours when the daily maximum exceeds a threshold (no-mow window) and extends the minimum interval between sessions on hot days |
+| **Dew avoidance** | Delays the start until dew has evaporated; the duration is auto-estimated from dew point, humidity, temperature and wind, or set to a fixed offset |
+
+> **Hint — heat stress and adaptive mowing:** with [adaptive mowing](#adaptive-mowing) on, only the midday no-mow window of heat-stress protection still applies; its reduced hot-day interval is ignored. Hot weather is then handled by the growth index instead. Details are in the [Adaptive Mowing](#adaptive-mowing) hint below.
+
+### Adaptive Mowing
+
+The mower cannot tell how well it covers the lawn, so a fixed "X hours every N days" is only a guess: it over-mows a dormant lawn in a drought and under-mows it when rain brings a growth burst. **Adaptive mowing** (Planner tab → *Mowing Parameters*) derives frequency and duration from an estimate of how much the grass has grown.
+
+**Growth index.** For each day the planner computes a growth index from 0 (dormant) to 1 (peak growth) as `temperature factor × water factor`:
+
+- *Temperature* — 0 below 5 °C and above 35 °C, 1 between 15 and 24 °C, linear in between (cool-season grass).
+- *Water* — a soil-water bucket (capacity configurable, default 40 mm) filled by rain and drained by 0.8 × evapotranspiration, simulated over the last 14 days plus the forecast. Growth is unrestricted while the bucket is at least half full and drops towards zero as it dries out.
+
+Weather inputs come from the same Open-Meteo request as the forecast (`past_days=14`, daily mean temperature, precipitation and ET₀); no extra API key is needed.
+
+**Mowing backlog.** Each day the backlog grows by `growth index × (session hours ÷ interval days)` and is reduced by the mowing actually recorded in `mow_history.json`. A day is mowed once the backlog reaches 75 % of a full session, and the session covers the backlog (cycle-aware window sizing still applies). The backlog is capped at two sessions. Once mowing has started on a day the planner keeps going until the backlog is nearly paid off, so a weather-interrupted session is resumed.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `adaptive_enabled` | off | Use the growth model instead of the fixed interval and daily target |
+| `adaptive_session_hours` | 3.0 | Mowing hours per session at peak growth |
+| `adaptive_peak_interval_days` | 2 | Days between sessions at peak growth |
+| `adaptive_soil_capacity_mm` | 40 | Plant-available water the soil can hold |
+
+With the defaults the mower runs 3 h every 2 days at peak growth, about every 4 days at growth 0.5, and rarely during a drought. When adaptive mode is on, `target_hours_per_day`, `mowing_interval_days` and the heat-stress interval are ignored; windows, weather thresholds, dew, hedgehog and heat-stress no-mow zones still apply. Days skipped because the backlog is too small appear as **Growth** in the planning log.
+
+> **Hint — heat-stress protection:** with adaptive mode on, only the midday no-mow window of heat-stress protection still applies; its reduced hot-day interval is ignored. Hot weather is instead handled by the growth index, which falls above 24 °C (mean temperature) and is 0 at 35 °C. Because the model uses the daily *mean* while heat stress triggers on the daily *maximum*, a day with a 30 °C maximum but a 22 °C mean still counts as full growth. If a no-mow window leaves no usable time, the backlog carries over to the next day.
+
+The **Lawn Growth** panel (see the screenshot above) shows the last 7 days and the forecast — growth index, soil water, rain, mowed minutes — and the current backlog. In the demo data a dry spell drains the soil and the growth index fades towards zero; the rain in the forecast brings it back. The panel is filled on every planner run even when adaptive mode is off, so you can compare it with the real state of your lawn before enabling it. Irrigation is not modelled.
+
+### Planner executor, watchdog and mow history
+
+- **Executor** — dispatches the computed sessions to the mower at the right time via direct override commands, deducting already-completed mowing from the daily target.
+- **Weather watchdog** — polls *current* conditions every N minutes; parks the mower (HOME mode) if a thunderstorm or threshold breach is detected mid-session, and resumes automatically when conditions clear. An optional **drying delay** holds the resume for a configurable time after the weather clears so the lawn can dry; if that delay outlasts the interrupted session's window, the planner replans a make-up session (today if a window still allows it, otherwise the next valid day).
+- **Mow history** — records actual mowing time per day so the planner's interval logic and the adaptive backlog reflect reality even after missed or weather-cancelled sessions.
+- **City geocoding** — resolve a city name to coordinates via Open-Meteo for the planner location.
+
+### Control Modes
+
+The app behaves differently depending on whether the **planner** is enabled (toggle in the Planner tab).
+
+| | **Classic mode** (planner disabled) | **Smart mode** (planner enabled) |
+|---|---|---|
+| Schedule | Firmware weekly schedule, editable in the Schedule tab | Owned by the planner; the firmware holds a harmless placeholder task and the Schedule editor is locked |
+| Mowing | Mower follows its own weekly calendar | The planner's executor dispatches computed sessions via direct override commands |
+| Manual **Mow** | Raw `SetOverrideMow` for the chosen duration | Clears any user-park, installs a synthetic session so the executor parks at the right time, then resumes planned sessions |
+| **Pause / Park&nbsp;Home** | Raw firmware command | Also sets a *user inhibit* so the executor skips upcoming sessions until you **Resume** |
+| **Resume** | `ClearOverride` + AUTO + start | Clears the inhibit and restores the active session window without cancelling the executor's override |
+| **Park** (skip session) | Park until next firmware start | Cancels the current session only; the next planned session runs normally |
+
+In Smart mode the **Status** tab's **Session** field shows the live session context (e.g. "Mowing until 18:30 (45 min left)", "Charging until ~17:05 — mowing until 18:30", "Next: Fri 27 Jun at 09:00 (90 min)", or "Parked by user — next session will be skipped"). While a session is running it always reflects the *current* session — derived from the planner's tracked session, or, after a restart/reconnect, from the firmware override — rather than the next planned one.
+
+### Runtime Estimator
+
+The **Statistics** tab includes a runtime estimator that learns from observed battery samples:
+
+- The sampler background task records battery level, activity, and charging state every 60 seconds while connected (`runtime_samples.json`, max 2,000 entries ≈ 33 h)
+- From completed mowing and charging segments it derives **discharge rate** (%/h), **charge rate** (%/h), and the **return-to-station battery threshold**
+- If insufficient sample data exists it falls back to lifetime averages from the mower's own statistics
+- The **Estimate** button projects mowing hours, charging hours, and number of charge stops for any planned session duration
+- Samples survive restarts; use the **🗑️** button to reset and start fresh
 
 ---
 
@@ -112,7 +216,7 @@ pip install -e .
 python web_app.py --host 127.0.0.1 --port 8080
 ```
 
-Open **http://127.0.0.1:8080** in your browser.
+Open **http://127.0.0.1:8080** in your browser, go to **Connect** to pair the mower, then to **Planner** to set your location, time windows and thresholds.
 
 > **Optional:** protect the UI with a password:
 > ```bash
@@ -190,6 +294,23 @@ sudo systemctl status automower
 sudo journalctl -u automower -f
 ```
 
+### Web server options
+
+```bash
+python web_app.py [options]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--host` | `127.0.0.1` | Interface to bind |
+| `--port` | `8080` | Port to listen on |
+| `--log-level` | `info` | `debug` / `info` / `warning` / `error` |
+| `--password` | _(none)_ | Web UI password (or `AUTH_PASSWORD` env var); auth disabled if omitted |
+| `--secret-key` | random | Session-cookie signing secret (or `SECRET_KEY` env var); set for stable sessions across restarts |
+| `--log-file` | _(none)_ | Also write logs to this rotating file |
+| `--log-max-mb` | `10` | Max size (MB) before the log file rotates |
+| `--log-backups` | `5` | Number of rotated log files to keep |
+
 ---
 
 ## Authentication
@@ -211,66 +332,9 @@ The web UI can be protected with a single password. When enabled, all routes (ex
 
 ---
 
-## Control Modes
-
-The app behaves differently depending on whether the **planner** is enabled (toggle in the Planner tab).
-
-| | **Classic mode** (planner disabled) | **Smart mode** (planner enabled) |
-|---|---|---|
-| Schedule | Firmware weekly schedule, editable in the Schedule tab | Owned by the planner; the firmware holds a harmless placeholder task and the Schedule editor is locked |
-| Mowing | Mower follows its own weekly calendar | The planner's executor dispatches computed sessions via direct override commands |
-| Manual **Mow** | Raw `SetOverrideMow` for the chosen duration | Clears any user-park, installs a synthetic session so the executor parks at the right time, then resumes planned sessions |
-| **Pause / Park&nbsp;Home** | Raw firmware command | Also sets a *user inhibit* so the executor skips upcoming sessions until you **Resume** |
-| **Resume** | `ClearOverride` + AUTO + start | Clears the inhibit and restores the active session window without cancelling the executor's override |
-| **Park** (skip session) | Park until next firmware start | Cancels the current session only; the next planned session runs normally |
-
-In Smart mode the **Status** tab's **Session** field shows the live session context (e.g. "Mowing until 18:30 (45 min left)", "Charging until ~17:05 — mowing until 18:30", "Next: Fri 27 Jun at 09:00 (90 min)", or "Parked by user — next session will be skipped"). While a session is running it always reflects the *current* session — derived from the planner's tracked session, or, after a restart/reconnect, from the firmware override — rather than the next planned one.
-
----
-
-## Adaptive Mowing
-
-The mower cannot tell how well it covers the lawn, so a fixed "X hours every N days" is only a guess: it over-mows a dormant lawn in a drought and under-mows it when rain brings a growth burst. **Adaptive mowing** (Planner tab → *Mowing Parameters*) derives frequency and duration from an estimate of how much the grass has grown.
-
-**Growth index.** For each day the planner computes a growth index from 0 (dormant) to 1 (peak growth) as `temperature factor × water factor`:
-
-- *Temperature* — 0 below 5 °C and above 35 °C, 1 between 15 and 24 °C, linear in between (cool-season grass).
-- *Water* — a soil-water bucket (capacity configurable, default 40 mm) filled by rain and drained by 0.8 × evapotranspiration, simulated over the last 14 days plus the forecast. Growth is unrestricted while the bucket is at least half full and drops towards zero as it dries out.
-
-Weather inputs come from the same Open-Meteo request as the forecast (`past_days=14`, daily mean temperature, precipitation and ET₀); no extra API key is needed.
-
-**Mowing backlog.** Each day the backlog grows by `growth index × (session hours ÷ interval days)` and is reduced by the mowing actually recorded in `mow_history.json`. A day is mowed once the backlog reaches 75 % of a full session, and the session covers the backlog (cycle-aware window sizing still applies). The backlog is capped at two sessions. Once mowing has started on a day the planner keeps going until the backlog is nearly paid off, so a weather-interrupted session is resumed.
-
-| Setting | Default | Meaning |
-|---|---|---|
-| `adaptive_enabled` | off | Use the growth model instead of the fixed interval and daily target |
-| `adaptive_session_hours` | 3.0 | Mowing hours per session at peak growth |
-| `adaptive_peak_interval_days` | 2 | Days between sessions at peak growth |
-| `adaptive_soil_capacity_mm` | 40 | Plant-available water the soil can hold |
-
-With the defaults the mower runs 3 h every 2 days at peak growth, about every 4 days at growth 0.5, and rarely during a drought. When adaptive mode is on, `target_hours_per_day`, `mowing_interval_days` and the heat-stress interval are ignored; windows, weather thresholds, dew, hedgehog and heat-stress no-mow zones still apply. Days skipped because the backlog is too small appear as **Growth** in the planning log.
-
-> **Hint — heat-stress protection:** with adaptive mode on, only the midday no-mow window of heat-stress protection still applies; its reduced hot-day interval is ignored. Hot weather is instead handled by the growth index, which falls above 24 °C (mean temperature) and is 0 at 35 °C. Because the model uses the daily *mean* while heat stress triggers on the daily *maximum*, a day with a 30 °C maximum but a 22 °C mean still counts as full growth. If a no-mow window leaves no usable time, the backlog carries over to the next day.
-
-The **Lawn Growth** panel in the Planner tab shows the last 7 days and the forecast (growth index, soil water, rain, mowed minutes) and the current backlog. It is filled on every planner run even when adaptive mode is off, so you can compare it with the real state of your lawn before enabling it. Irrigation is not modelled.
-
----
-
-## Runtime Estimator
-
-The **Statistics** tab includes a runtime estimator that learns from observed battery samples:
-
-- The sampler background task records battery level, activity, and charging state every 60 seconds while connected (`runtime_samples.json`, max 2,000 entries ≈ 33 h)
-- From completed mowing and charging segments it derives **discharge rate** (%/h), **charge rate** (%/h), and the **return-to-station battery threshold**
-- If insufficient sample data exists it falls back to lifetime averages from the mower's own statistics
-- The **Estimate** button projects mowing hours, charging hours, and number of charge stops for any planned session duration
-- Samples survive restarts; use the **🗑️** button to reset and start fresh
-
----
-
 ## Configuration Files
 
-Both files are created automatically on first use and are reloaded at runtime without restart.
+All files are created automatically on first use and are reloaded at runtime without restart.
 
 **`reconnect_config.json`** — BLE connection target:
 ```json
@@ -292,7 +356,6 @@ These are written automatically while the server runs and need no manual editing
 | `mow_history.json` | Actual mowing seconds per day (pruned to 90 days); seeds the planner's interval constraint and the adaptive-mowing backlog |
 | `planned_sessions.json` | Upcoming planned sessions awaiting dispatch |
 | `plan_log.json` | Per-day decision log from the last planning run |
-
 
 ---
 
@@ -319,22 +382,64 @@ An interactive testing CLI is also provided:
 python mower_test_cli.py
 ```
 
-### Web server options
+---
 
-```bash
-python web_app.py [options]
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                  AutoMower-BLE Stack                    │
+│                                                         │
+│  Browser  ──HTTP──►  web_app.py  (FastAPI / uvicorn)   │
+│                           │                             │
+│        ┌──────────────────┼──────────────────┐          │
+│        │                  │                  │          │
+│   planner.py         automower_ble/    background loops │
+│  PlannerAgent +       mower.py         (reconnect /     │
+│  WeatherWatchdog      protocol.py       sampler /       │
+│        │              protocol.json     idle-sleep)     │
+│        │                  │                  │          │
+│  Open-Meteo API       BLE (bleak) ◄──────────┘          │
+│  (forecast +              │                             │
+│   current wx)             │                             │
+│                    Husqvarna Automower                  │
+└─────────────────────────────────────────────────────────┘
 ```
 
-| Option | Default | Description |
-|---|---|---|
-| `--host` | `127.0.0.1` | Interface to bind |
-| `--port` | `8080` | Port to listen on |
-| `--log-level` | `info` | `debug` / `info` / `warning` / `error` |
-| `--password` | _(none)_ | Web UI password (or `AUTH_PASSWORD` env var); auth disabled if omitted |
-| `--secret-key` | random | Session-cookie signing secret (or `SECRET_KEY` env var); set for stable sessions across restarts |
-| `--log-file` | _(none)_ | Also write logs to this rotating file |
-| `--log-max-mb` | `10` | Max size (MB) before the log file rotates |
-| `--log-backups` | `5` | Number of rotated log files to keep |
+### Components
+
+| File / Package | Role |
+|---|---|
+| `automower_ble/protocol.json` | Reverse-engineered BLE command definitions (major/minor IDs, request & response field types) |
+| `automower_ble/protocol.py` | Low-level BLE client: packet encoding/decoding, CRC, connection handshake, and resilient frame reassembly (handles fragmented, duplicated, and out-of-order notifications) |
+| `automower_ble/mower.py` | High-level mower API: `connect`, `set_schedule`, `mower_park`, `set_time`, etc. |
+| `automower_ble/models.py` | Mapping of `(deviceType, deviceVariant)` codes to human-readable model names |
+| `automower_ble/error_codes.py` | Enumeration of mower error / message codes |
+| `automower_ble/helpers.py` | Shared encoding/CRC helpers |
+| `web_app.py` | FastAPI web server — REST API + HTML page serving. Manages connection state, auto-reconnect, BLE idle sleep, time sync, runtime sampling |
+| `planner.py` | Weather-based planning agent (`PlannerAgent`) and real-time watchdog (`WeatherWatchdog`) |
+| `growth.py` | Lawn growth model (growth index from temperature and a soil-water bucket) and mowing backlog used by adaptive mowing |
+| `templates/index.html` | Single-page Bootstrap 5 UI (7 tabs: Connect, Status, Commands, Schedule, Statistics, Messages, Planner) |
+| `templates/login.html` | Password login page (shown when authentication is enabled) |
+| `ble_scanner.py` | Standalone CLI scanner that lists nearby Husqvarna BLE devices |
+| `mower_test_cli.py` | Interactive CLI for exercising mower commands without the web app |
+| `tests/` | `pytest` suite — BLE protocol, web API, planner logic, growth model, weather-watchdog coordination, and Playwright UI tests |
+| `docs/make_screenshots.py` | Regenerates the screenshots in `docs/images/` from synthetic demo data |
+| `planner_config.json` | Persisted planner settings (location, windows, thresholds, protections, watchdog) |
+| `reconnect_config.json` | Persisted BLE address, channel ID, PIN, and auto-reconnect flag |
+| `runtime_samples.json` | Rolling battery/activity samples used by the runtime estimator |
+| `mow_history.json` | Actual recorded mowing time per day (seeds the planner's interval constraint and adaptive-mowing backlog) |
+| `planned_sessions.json` | Upcoming planned mowing sessions dispatched by the planner's executor |
+| `plan_log.json` | Per-day decision log from the last planning run (shown in the Planner tab) |
+
+### BLE features
+
+- **BLE pairing & control** — scan, connect, pair (with optional PIN), send all standard commands
+- **Auto-reconnect** — background loop re-connects automatically after a dropout, recovering from BlueZ "zombie" links. The protocol layer reassembles fragmented BLE notifications, drops the firmware's duplicate-notification floods, and skips unsolicited frames so a reconnect mid-mow recovers cleanly
+- **BLE idle sleep** — disconnects automatically when the web UI is idle and the mower is parked, then reconnects on the next request or upcoming planned session, to save energy
+- **Clock sync** — mower clock synced to local time on every connect
+- **Flash wear protection** — schedule is only written to the mower when it actually changes
+- **Rotating file logging** — optional `--log-file` with size-based rotation for multi-day diagnostics
 
 ---
 
@@ -348,12 +453,12 @@ The BLE protocol tests run with no extra dependencies:
 python -m unittest discover -s tests -v
 ```
 
-The full suite (protocol + web API + planner + watchdog) uses `pytest`. Install
+The full suite (protocol + web API + planner + growth + watchdog) uses `pytest`. Install
 the test extras and run:
 
 ```bash
 pip install -e ".[test]"
-pytest                      # protocol, web API, planner and watchdog tests
+pytest                      # protocol, web API, planner, growth and watchdog tests
 ```
 
 The web-API, planner and watchdog tests need no Bluetooth hardware — the BLE
@@ -385,6 +490,16 @@ pytest tests/test_ui_playwright.py
 > For this reason the UI file is excluded from the default `pytest` run via
 > `addopts` in `pyproject.toml`. Use `pytest` for everything else and
 > `pytest tests/test_ui_playwright.py` for the UI layer.
+
+#### Regenerating the screenshots
+
+The pictures in `docs/images/` are produced by driving the real web app in a headless browser against synthetic weather, mow history and mower status — no hardware, network or personal configuration involved:
+
+```bash
+pip install -e ".[ui]"
+playwright install chromium
+python docs/make_screenshots.py
+```
 
 ### Command Protocol
 
@@ -431,3 +546,12 @@ cp husqvarna_automower_protocol.lua ~/.config/wireshark/plugins/
 ```
 
 Filter for outgoing requests: `btatt.opcode == 0x52`
+
+---
+
+## Credits
+
+- **[Alistair Francis (alistair23)](https://github.com/alistair23)** — reverse-engineered the Automower Bluetooth protocol and wrote the original [AutoMower-BLE](https://github.com/alistair23/AutoMower-BLE) library on which the BLE command layer in `automower_ble/` is based. Write-up: [Reverse engineering Automower BLE](https://www.alistair23.me/2024/01/06/reverse-engineering-automower-ble). Thank you!
+- [Open-Meteo](https://open-meteo.com) — free weather, archive and geocoding APIs used by the planner.
+
+This project is licensed under the GNU GPL v3 (see [LICENSE](LICENSE)). It is unofficial and not affiliated with Husqvarna.

@@ -353,7 +353,7 @@ class TestPagesRender:
     def test_index_renders(self, client):
         r = client.get("/")
         assert r.status_code == 200
-        assert "Automower BLE Control" in r.text
+        assert "Sir Schnittalot" in r.text
         assert 'id="nav-conn-badge"' in r.text
 
     def test_login_page_renders(self, web):

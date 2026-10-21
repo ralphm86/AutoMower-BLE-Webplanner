@@ -116,7 +116,7 @@ STATUS_MOWING = {
 class TestPageLoad:
     def test_title_and_navbar(self, page, live_server):
         page.goto(live_server)
-        assert "Automower BLE Control" in page.content()
+        assert "Sir Schnittalot" in page.content()
         assert page.locator("#nav-conn-badge").is_visible()
 
     def test_disconnected_badge(self, page, live_server):

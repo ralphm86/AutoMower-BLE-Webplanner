@@ -615,7 +615,7 @@ async def lifespan(app: FastAPI):
     await watchdog.stop()
 
 
-app = FastAPI(title="Automower BLE Control", lifespan=lifespan)
+app = FastAPI(title="Sir Schnittalot", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="."), name="static")
 templates = Jinja2Templates(directory="templates")
 
