@@ -1739,6 +1739,10 @@ class PlannerConfigRequest(BaseModel):
     dew_avoidance_enabled: bool = False
     dew_avoidance_auto: bool = True
     dew_avoidance_hours_after_sunrise: float = 2.0
+    adaptive_enabled: bool = False
+    adaptive_session_hours: float = 3.0
+    adaptive_peak_interval_days: int = 2
+    adaptive_soil_capacity_mm: float = 40.0
 
 
 @app.get("/api/planner/config")
@@ -1820,8 +1824,12 @@ async def get_planner_status():
 
 @app.get("/api/planner/forecast")
 async def get_planner_forecast():
-    """Return the last fetched weather forecast and daily sunrise/sunset data."""
-    return {"forecast": planner.last_forecast, "daily": planner.last_daily}
+    """Return the last fetched weather forecast, sunrise/sunset and lawn growth data."""
+    return {
+        "forecast": planner.last_forecast,
+        "daily": planner.last_daily,
+        "growth": planner.last_growth,
+    }
 
 
 @app.get("/api/mow_history")

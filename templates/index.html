@@ -497,6 +497,38 @@
               <div class="text-muted small mt-1">Minimum days between mowing sessions (1 = every available day).</div>
             </div>
 
+            <hr>
+            <div class="form-check form-switch mb-2">
+              <input id="pl-adaptive" type="checkbox" class="form-check-input" role="switch" />
+              <label class="form-check-label fw-semibold" for="pl-adaptive">
+                🌱 Adaptive Mowing (lawn growth model)
+              </label>
+              <div class="text-muted small">Replaces the fixed hours and interval above: mowing frequency and duration follow estimated grass growth from recent and forecast temperature, rain and evaporation. Without this switch the growth model is only shown in the Lawn Growth panel.</div>
+            </div>
+            <div class="row g-2 mb-2 ms-3">
+              <div class="col-6 col-sm-4">
+                <label class="form-label small">Session at peak growth</label>
+                <div class="input-group input-group-sm">
+                  <input id="pl-ad-session" type="number" class="form-control" value="3" min="0.5" max="12" step="0.5" />
+                  <span class="input-group-text">h</span>
+                </div>
+              </div>
+              <div class="col-6 col-sm-4">
+                <label class="form-label small">Interval at peak growth</label>
+                <div class="input-group input-group-sm">
+                  <input id="pl-ad-interval" type="number" class="form-control" value="2" min="1" max="14" step="1" />
+                  <span class="input-group-text">days</span>
+                </div>
+              </div>
+              <div class="col-6 col-sm-4">
+                <label class="form-label small">Soil water capacity</label>
+                <div class="input-group input-group-sm">
+                  <input id="pl-ad-soil" type="number" class="form-control" value="40" min="10" max="150" step="5" />
+                  <span class="input-group-text">mm</span>
+                </div>
+              </div>
+            </div>
+
           </div>
         </div>
       </div>
@@ -664,6 +696,14 @@
           </div>
           <div class="card-body" id="planner-status-content">
             <p class="text-muted">Click Refresh or Run Now to see status.</p>
+          </div>
+        </div>
+
+        <!-- Lawn growth model -->
+        <div class="card mb-4">
+          <div class="card-header"><i class="bi bi-flower1 me-2"></i>Lawn Growth</div>
+          <div class="card-body p-2" id="growth-content">
+            <p class="text-muted small m-1">Run the planner to see the growth model.</p>
           </div>
         </div>
 
@@ -1698,6 +1738,10 @@ async function loadPlannerConfig() {
     document.getElementById('pl-min-dur').value = cfg.min_duration_minutes ?? 30;
     document.getElementById('pl-max-dur').value = cfg.max_duration_minutes ?? 180;
     document.getElementById('pl-interval').value = cfg.mowing_interval_days ?? 2;
+    document.getElementById('pl-adaptive').checked = !!cfg.adaptive_enabled;
+    document.getElementById('pl-ad-session').value = cfg.adaptive_session_hours ?? 3;
+    document.getElementById('pl-ad-interval').value = cfg.adaptive_peak_interval_days ?? 2;
+    document.getElementById('pl-ad-soil').value = cfg.adaptive_soil_capacity_mm ?? 40;
     document.getElementById('pl-rain').value = cfg.max_rain_mm_h ?? 0.5;
     document.getElementById('pl-wind').value = cfg.max_wind_speed_ms ?? 10;
     document.getElementById('pl-temp').value = cfg.min_temp_celsius ?? 5;
@@ -1829,6 +1873,10 @@ async function savePlannerConfig() {
     min_duration_minutes: parseInt(document.getElementById('pl-min-dur').value) || 30,
     max_duration_minutes: parseInt(document.getElementById('pl-max-dur').value) || 180,
     mowing_interval_days: parseInt(document.getElementById('pl-interval').value) || 2,
+    adaptive_enabled: document.getElementById('pl-adaptive').checked,
+    adaptive_session_hours: parseFloat(document.getElementById('pl-ad-session').value) || 3,
+    adaptive_peak_interval_days: parseInt(document.getElementById('pl-ad-interval').value) || 2,
+    adaptive_soil_capacity_mm: parseFloat(document.getElementById('pl-ad-soil').value) || 40,
     max_rain_mm_h: parseFloat(document.getElementById('pl-rain').value) ?? 0.5,
     max_wind_speed_ms: parseFloat(document.getElementById('pl-wind').value) ?? 10,
     min_temp_celsius: parseFloat(document.getElementById('pl-temp').value) ?? 5,
@@ -2013,6 +2061,7 @@ function renderPlannerLog(logEntries) {
     scheduled:    '<span class="badge bg-success">Scheduled</span>',
     weather:      '<span class="badge bg-primary">Weather</span>',
     interval:     '<span class="badge bg-warning text-dark">Interval</span>',
+    growth:       '<span class="badge bg-success bg-opacity-50 text-dark">🌱 Growth</span>',
     no_window:    '<span class="badge bg-secondary">No Window</span>',
     past_window:  '<span class="badge bg-dark">Past Window</span>',
     short_window: '<span class="badge bg-secondary">Short Window</span>',
@@ -2095,12 +2144,54 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 });
 
+function renderGrowth(g) {
+  const el = document.getElementById('growth-content');
+  if (!g || !g.days || !g.days.length) {
+    el.innerHTML = '<p class="text-muted small m-1">Run the planner to see the growth model.</p>';
+    return;
+  }
+  const todayIso = new Date().toLocaleDateString('sv');
+  const rows = g.days.map(d => {
+    const pct = Math.round(d.growth * 100);
+    const col = d.water_factor < 0.5 ? 'bg-warning' : 'bg-success';
+    const dow = _DOW_NAMES[(new Date(d.date).getDay() + 6) % 7];
+    const rain = d.precip_mm != null ? d.precip_mm.toFixed(1) : '\u2014';
+    const mowed = d.mowed_min ? `${d.mowed_min}\u00a0min` : '';
+    return `<tr class="${d.date === todayIso ? 'table-active' : ''}${d.past ? ' text-muted' : ''}">
+      <td class="font-monospace small">${escHtml(d.date.substring(5))} ${dow}</td>
+      <td style="min-width:90px">
+        <div style="height:10px;background:#e9ecef;border-radius:4px">
+          <div class="${col}" style="width:${pct}%;height:100%;border-radius:4px"></div>
+        </div>
+      </td>
+      <td class="small text-end">${d.growth.toFixed(2)}</td>
+      <td class="small text-end">${d.soil_mm.toFixed(0)}</td>
+      <td class="small text-end">${rain}</td>
+      <td class="small text-end">${mowed}</td>
+    </tr>`;
+  }).join('');
+  el.innerHTML = `
+    <div class="small mb-2 px-1">
+      Mowing backlog at start of today: <strong>${g.backlog_h.toFixed(1)} h</strong>
+      (mow at \u2265 ${g.trigger_h.toFixed(1)} h)
+      ${g.adaptive_enabled
+        ? '<span class="badge bg-success ms-1">drives the plan</span>'
+        : '<span class="badge bg-secondary ms-1">display only</span>'}
+    </div>
+    <div class="table-responsive"><table class="table table-sm mb-0">
+      <thead class="table-light"><tr>
+        <th>Day</th><th>Growth</th><th class="text-end">Index</th>
+        <th class="text-end">Soil mm</th><th class="text-end">Rain mm</th><th class="text-end">Mowed</th>
+      </tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
 async function loadPlannerForecast() {
   try {
     const [fdata, cfg] = await Promise.all([
       api('GET', '/api/planner/forecast'),
       api('GET', '/api/planner/config'),
     ]);
+    renderGrowth(fdata.growth);
     const el = document.getElementById('forecast-content');
     if (!fdata.forecast || !fdata.forecast.length) {
       el.innerHTML = '<p class="text-muted p-3">No forecast data yet.</p>';

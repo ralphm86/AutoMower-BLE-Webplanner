@@ -44,6 +44,7 @@ Details on the reverse-engineering process: https://www.alistair23.me/2024/01/06
 | `automower_ble/helpers.py` | Shared encoding/CRC helpers |
 | `web_app.py` | FastAPI web server — REST API + HTML page serving. Manages connection state, auto-reconnect, BLE idle sleep, time sync, runtime sampling |
 | `planner.py` | Weather-based planning agent (`PlannerAgent`) and real-time watchdog (`WeatherWatchdog`) |
+| `growth.py` | Lawn growth model (growth index from temperature and a soil-water bucket) and mowing backlog used by adaptive mowing |
 | `templates/index.html` | Single-page Bootstrap 5 UI (7 tabs: Connect, Status, Commands, Schedule, Statistics, Messages, Planner) |
 | `templates/login.html` | Password login page (shown when authentication is enabled) |
 | `ble_scanner.py` | Standalone CLI scanner that lists nearby Husqvarna BLE devices |
@@ -52,7 +53,7 @@ Details on the reverse-engineering process: https://www.alistair23.me/2024/01/06
 | `planner_config.json` | Persisted planner settings (location, windows, thresholds, protections, watchdog) |
 | `reconnect_config.json` | Persisted BLE address, channel ID, PIN, and auto-reconnect flag |
 | `runtime_samples.json` | Rolling battery/activity samples used by the runtime estimator |
-| `mow_history.json` | Actual recorded mowing time per day (seeds the planner's interval constraint) |
+| `mow_history.json` | Actual recorded mowing time per day (seeds the planner's interval constraint and adaptive-mowing backlog) |
 | `planned_sessions.json` | Upcoming planned mowing sessions dispatched by the planner's executor |
 | `plan_log.json` | Per-day decision log from the last planning run (shown in the Planner tab) |
 
@@ -70,9 +71,10 @@ Details on the reverse-engineering process: https://www.alistair23.me/2024/01/06
   - per-session min/max duration
   - rain, wind speed, temperature, and post-rain delay thresholds
   - **hedgehog protection** (daylight-only mowing, sunrise→sunset)
-  - **heat-stress protection** (midday no-mow window + reduced frequency on hot days)
+  - **heat-stress protection** (midday no-mow window + reduced frequency on hot days; with [adaptive mowing](#adaptive-mowing) only the no-mow window applies)
   - **dew avoidance** (delay start until dew has evaporated, auto-estimated or fixed)
   - **cycle-aware sizing** (inflates the window so actual cutting time hits the target despite charging breaks)
+  - **adaptive mowing** (optional: frequency and duration follow estimated lawn growth instead of a fixed interval/target — see [Adaptive Mowing](#adaptive-mowing))
 - **Planner executor** — dispatches the computed sessions to the mower at the right time via direct override commands, deducting already-completed mowing from the daily target
 - **City geocoding** — resolve a city name to coordinates via Open-Meteo for the planner location
 - **Weather watchdog** — polls *current* conditions every N minutes; parks the mower (HOME mode) if a thunderstorm or threshold breach is detected mid-session, resumes automatically when conditions clear. An optional **drying delay** holds the resume for a configurable time after the weather clears so the lawn can dry; if that delay outlasts the interrupted session's window, the planner replans a make-up session (today if a window still allows it, otherwise the next valid day)
@@ -226,6 +228,34 @@ In Smart mode the **Status** tab's **Session** field shows the live session cont
 
 ---
 
+## Adaptive Mowing
+
+The mower cannot tell how well it covers the lawn, so a fixed "X hours every N days" is only a guess: it over-mows a dormant lawn in a drought and under-mows it when rain brings a growth burst. **Adaptive mowing** (Planner tab → *Mowing Parameters*) derives frequency and duration from an estimate of how much the grass has grown.
+
+**Growth index.** For each day the planner computes a growth index from 0 (dormant) to 1 (peak growth) as `temperature factor × water factor`:
+
+- *Temperature* — 0 below 5 °C and above 35 °C, 1 between 15 and 24 °C, linear in between (cool-season grass).
+- *Water* — a soil-water bucket (capacity configurable, default 40 mm) filled by rain and drained by 0.8 × evapotranspiration, simulated over the last 14 days plus the forecast. Growth is unrestricted while the bucket is at least half full and drops towards zero as it dries out.
+
+Weather inputs come from the same Open-Meteo request as the forecast (`past_days=14`, daily mean temperature, precipitation and ET₀); no extra API key is needed.
+
+**Mowing backlog.** Each day the backlog grows by `growth index × (session hours ÷ interval days)` and is reduced by the mowing actually recorded in `mow_history.json`. A day is mowed once the backlog reaches 75 % of a full session, and the session covers the backlog (cycle-aware window sizing still applies). The backlog is capped at two sessions. Once mowing has started on a day the planner keeps going until the backlog is nearly paid off, so a weather-interrupted session is resumed.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `adaptive_enabled` | off | Use the growth model instead of the fixed interval and daily target |
+| `adaptive_session_hours` | 3.0 | Mowing hours per session at peak growth |
+| `adaptive_peak_interval_days` | 2 | Days between sessions at peak growth |
+| `adaptive_soil_capacity_mm` | 40 | Plant-available water the soil can hold |
+
+With the defaults the mower runs 3 h every 2 days at peak growth, about every 4 days at growth 0.5, and rarely during a drought. When adaptive mode is on, `target_hours_per_day`, `mowing_interval_days` and the heat-stress interval are ignored; windows, weather thresholds, dew, hedgehog and heat-stress no-mow zones still apply. Days skipped because the backlog is too small appear as **Growth** in the planning log.
+
+> **Hint — heat-stress protection:** with adaptive mode on, only the midday no-mow window of heat-stress protection still applies; its reduced hot-day interval is ignored. Hot weather is instead handled by the growth index, which falls above 24 °C (mean temperature) and is 0 at 35 °C. Because the model uses the daily *mean* while heat stress triggers on the daily *maximum*, a day with a 30 °C maximum but a 22 °C mean still counts as full growth. If a no-mow window leaves no usable time, the backlog carries over to the next day.
+
+The **Lawn Growth** panel in the Planner tab shows the last 7 days and the forecast (growth index, soil water, rain, mowed minutes) and the current backlog. It is filled on every planner run even when adaptive mode is off, so you can compare it with the real state of your lawn before enabling it. Irrigation is not modelled.
+
+---
+
 ## Runtime Estimator
 
 The **Statistics** tab includes a runtime estimator that learns from observed battery samples:
@@ -259,7 +289,7 @@ These are written automatically while the server runs and need no manual editing
 | File | Contents |
 |---|---|
 | `runtime_samples.json` | Rolling battery/activity samples for the runtime estimator |
-| `mow_history.json` | Actual mowing seconds per day (pruned to 90 days) |
+| `mow_history.json` | Actual mowing seconds per day (pruned to 90 days); seeds the planner's interval constraint and the adaptive-mowing backlog |
 | `planned_sessions.json` | Upcoming planned sessions awaiting dispatch |
 | `plan_log.json` | Per-day decision log from the last planning run |
 

@@ -23,6 +23,7 @@ import urllib.parse
 import urllib.error
 
 from automower_ble.protocol import TaskInformation, MowerActivity
+import growth as growth_model
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,12 @@ DEFAULT_CONFIG: dict = {
     "dew_avoidance_enabled": False,
     "dew_avoidance_auto": True,             # auto-estimate from forecast; False = fixed offset
     "dew_avoidance_hours_after_sunrise": 2.0,  # cap (auto) or fixed offset (manual)
+    # Adaptive mowing: derive frequency/duration from a weather-driven lawn growth
+    # model instead of the fixed interval and daily target above.
+    "adaptive_enabled": False,
+    "adaptive_session_hours": 3.0,        # mowing hours per session at peak growth
+    "adaptive_peak_interval_days": 2,     # days between sessions at peak growth
+    "adaptive_soil_capacity_mm": 40.0,    # plant-available water the soil can hold
     # Runtime state (persisted for display only)
     "last_plan_time": None,
     "last_plan_result": "Never run",
@@ -260,16 +267,22 @@ _WMO_DESCRIPTIONS: dict[int, str] = {
 }
 
 
+# Days of history requested so the growth model can see recent drought/rain.
+_PAST_DAYS = 14
+
+
 def _fetch_openmeteo_sync(lat: float, lon: float) -> dict:
     """Blocking HTTP call to Open-Meteo — run via asyncio executor."""
     params = urllib.parse.urlencode({
         "latitude": lat,
         "longitude": lon,
         "hourly": "temperature_2m,precipitation,windspeed_10m,weathercode,dew_point_2m,relative_humidity_2m",
-        "daily": "sunrise,sunset,temperature_2m_max,wind_speed_10m_max",
+        "daily": ("sunrise,sunset,temperature_2m_max,wind_speed_10m_max,"
+                  "temperature_2m_mean,precipitation_sum,et0_fao_evapotranspiration"),
         "wind_speed_unit": "ms",
         "timezone": "auto",
         "forecast_days": 7,
+        "past_days": _PAST_DAYS,
     })
     url = f"https://api.open-meteo.com/v1/forecast?{params}"
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
@@ -297,6 +310,13 @@ def parse_daily(data: dict) -> dict[str, dict]:
     sunsets    = daily.get("sunset", [])
     temp_maxes = daily.get("temperature_2m_max", [])
     wind_maxes = daily.get("wind_speed_10m_max", [])
+    temp_means = daily.get("temperature_2m_mean", [])
+    precips    = daily.get("precipitation_sum", [])
+    et0s       = daily.get("et0_fao_evapotranspiration", [])
+
+    def _val(arr: list, i: int) -> Optional[float]:
+        return float(arr[i]) if i < len(arr) and arr[i] is not None else None
+
     utc_offset_sec = data.get("utc_offset_seconds", 0)
     tz = dt.timezone(dt.timedelta(seconds=utc_offset_sec))
     result: dict[str, dict] = {}
@@ -313,6 +333,9 @@ def parse_daily(data: dict) -> dict[str, dict]:
             "sunset":     ss,
             "temp_max_c": float(temp_maxes[i]) if i < len(temp_maxes) and temp_maxes[i] is not None else None,
             "wind_max_ms": float(wind_maxes[i]) if i < len(wind_maxes) and wind_maxes[i] is not None else None,
+            "temp_mean_c": _val(temp_means, i),
+            "precip_mm":   _val(precips, i),
+            "et0_mm":      _val(et0s, i),
         }
     return result
 
@@ -720,6 +743,7 @@ def plan_schedule(
     seeded_last_mow_date: Optional[dt.date] = None,
     cycle_data: Optional[dict] = None,
     already_mowed_today_sec: int = 0,
+    growth: Optional[dict] = None,
 ) -> tuple[list[dict], list[dict]]:
     """
     Build a mowing schedule for the next 7 days.
@@ -741,6 +765,12 @@ def plan_schedule(
     *already_mowed_today_sec* is the total actual mowing seconds accumulated
     today (completed sessions + any ongoing session).  The planner deducts
     this from today's target so a mid-day replan only schedules the remainder.
+
+    *growth* switches on adaptive mode: a dict with ``daily`` ({date: {growth}}),
+    ``carry_sec`` (mowing backlog at the start of today), ``per_day_sec``,
+    ``trigger_sec`` and ``cap_sec``.  The backlog grows with the daily growth
+    index; a day is mowed once it reaches the trigger and the session covers
+    the backlog.  This replaces the fixed interval and daily target.
     """
     today = dt.date.today()
 
@@ -793,9 +823,21 @@ def plan_schedule(
     last_mow_date: Optional[dt.date] = seeded_last_mow_date
     now = dt.datetime.now()
 
+    backlog_sec = float(growth["carry_sec"]) if growth else 0.0
+
     for offset in range(7):
         date = today + dt.timedelta(days=offset)
         dow = date.weekday()  # 0=Mon … 6=Sun
+
+        day_growth: Optional[float] = None
+        if growth:
+            day_growth = growth["daily"].get(date.isoformat(), {}).get("growth")
+            backlog_sec = min(
+                growth["cap_sec"],
+                backlog_sec + (day_growth or 0.0) * growth["per_day_sec"],
+            )
+            if offset == 0:
+                backlog_sec = max(0.0, backlog_sec - already_mowed_today_sec)
 
         def _log(status: str, reason: str, task_info=None):
             log.append({
@@ -821,8 +863,22 @@ def plan_schedule(
                 is_heat_stress_day = True
                 effective_interval = heat_stress_interval
 
-        # 2. Interval constraint
-        if last_mow_date is not None and (date - last_mow_date).days < effective_interval:
+        # 2. Interval constraint (adaptive mode uses the growth backlog instead)
+        if growth:
+            # Once mowing has started today, keep going until the backlog is nearly paid off.
+            trigger_sec = (
+                min_dur_sec if offset == 0 and already_mowed_today_sec > 0
+                else growth["trigger_sec"]
+            )
+            trigger_sec = max(trigger_sec, min_dur_sec)
+            if backlog_sec < trigger_sec:
+                _log(
+                    "growth",
+                    f"Growth {day_growth or 0.0:.2f}: backlog {backlog_sec / 3600:.1f} h "
+                    f"< {trigger_sec / 3600:.1f} h needed",
+                )
+                continue
+        elif last_mow_date is not None and (date - last_mow_date).days < effective_interval:
             _log(
                 "interval",
                 f"Interval: {effective_interval}d min"
@@ -834,11 +890,18 @@ def plan_schedule(
         # 3-5. Iterate over ALL configured windows for this day and accumulate
         #      sessions until the daily target is met or windows are exhausted.
         day_sessions: list[tuple[int, int, str]] = []  # (start_sec, dur_sec, reason)
+        backlog_before_sec = backlog_sec
         # For today: if some mowing has already happened, deduct it from the
         # target so a mid-day replan only schedules the remaining time rather
         # than the full target again.  Snap / cycle-aware window are
         # recalculated from the reduced mowing target.
-        if offset == 0 and already_mowed_today_sec > 0:
+        if growth:
+            remaining_sec = int(
+                _effective_window_sec(backlog_sec, mow_s, chg_s)
+                if cycle_data and cycle_data.get("avg_mow_h") and cycle_data.get("avg_chg_h")
+                else backlog_sec
+            )
+        elif offset == 0 and already_mowed_today_sec > 0:
             rem_mow = max(0, target_mow_sec - already_mowed_today_sec)
             if rem_mow < min_dur_sec:
                 _log(
@@ -855,6 +918,7 @@ def plan_schedule(
             )
         else:
             remaining_sec = target_dur_sec
+        day_target_sec = remaining_sec
         fail_status = "weather"
         fail_reason = "No suitable weather window found"
 
@@ -1053,13 +1117,21 @@ def plan_schedule(
                 "dow_name": DAY_NAMES[dow],
             })
         last_mow_date = date
+        if growth:
+            # Whatever the weather/windows left unscheduled stays owed.
+            backlog_sec = backlog_before_sec * max(0, remaining_sec) / day_target_sec
 
         log_reason = (
             day_sessions[0][2]
             if len(day_sessions) == 1
             else f"{len(day_sessions)} sessions planned"
         )
-        if _cycle_note:
+        if growth:
+            log_reason += (
+                f" [growth {day_growth or 0.0:.2f}, "
+                f"backlog {backlog_before_sec / 3600:.1f} h]"
+            )
+        elif _cycle_note:
             log_reason += _cycle_note
         _log(
             "scheduled",
@@ -1074,6 +1146,57 @@ def plan_schedule(
         )
 
     return sessions, log
+
+
+def compute_growth_plan(config: dict, all_daily: dict[str, dict]) -> tuple[Optional[dict], dict]:
+    """
+    Run the growth model over past + forecast daily weather.
+
+    Returns (plan_input, ui_summary).  plan_input is the ``growth`` argument
+    for plan_schedule, or None when adaptive mode is off or weather data is
+    missing.  ui_summary is filled whenever growth data exists, so the model
+    can be inspected before adaptive mode is switched on.
+    """
+    by_date = growth_model.simulate_growth(
+        all_daily, float(config.get("adaptive_soil_capacity_mm", 40.0))
+    )
+    if not by_date:
+        return None, {}
+
+    per_day, trigger, cap = growth_model.demand_params(
+        float(config.get("adaptive_session_hours", 3.0)),
+        int(config.get("adaptive_peak_interval_days", 2)),
+    )
+    mowed = {d: float(v.get("mow_sec", 0)) for d, v in load_mow_history().items()}
+    today_iso = dt.date.today().isoformat()
+    carry = growth_model.carried_backlog_sec(by_date, mowed, today_iso, per_day, cap)
+
+    first_iso = (dt.date.today() - dt.timedelta(days=7)).isoformat()
+    summary = {
+        "adaptive_enabled": bool(config.get("adaptive_enabled", False)),
+        "backlog_h": round(carry / 3600, 2),
+        "trigger_h": round(trigger / 3600, 2),
+        "days": [
+            {
+                "date": d,
+                "past": d < today_iso,
+                **g,
+                "precip_mm": all_daily[d].get("precip_mm"),
+                "mowed_min": round(mowed.get(d, 0.0) / 60),
+            }
+            for d, g in sorted(by_date.items()) if d >= first_iso
+        ],
+    }
+    if not config.get("adaptive_enabled"):
+        return None, summary
+    plan_input = {
+        "daily": by_date,
+        "carry_sec": carry,
+        "per_day_sec": per_day,
+        "trigger_sec": trigger,
+        "cap_sec": cap,
+    }
+    return plan_input, summary
 
 
 # ─── Background agent ─────────────────────────────────────────────────────────
@@ -1101,6 +1224,8 @@ class PlannerAgent:
         self.next_run_dt: Optional[dt.datetime] = None
         self.last_forecast: list[dict] = []
         self.last_daily: dict = {}
+        # Lawn growth model output for the UI (see compute_growth_plan).
+        self.last_growth: dict = {}
         # Planned sessions (absolute datetimes) computed by the last run_once().
         # The executor loop dispatches these at the right time.
         # Loaded from disk on startup so sessions survive server restarts.
@@ -1252,8 +1377,13 @@ class PlannerAgent:
             return self._set_result(f"Weather fetch failed: {e}")
 
         periods = parse_forecast(data)
-        daily   = parse_daily(data)
+        all_daily = parse_daily(data)
 
+        # Past days only feed the growth model; planning and the UI use today onward.
+        today_iso = dt.date.today().isoformat()
+        periods = [p for p in periods if p["dt"].date().isoformat() >= today_iso]
+        daily = {d: v for d, v in all_daily.items() if d >= today_iso}
+        growth_plan, self.last_growth = compute_growth_plan(config, all_daily)
         # Pre-compute per-day dew hours (same logic as plan_schedule) so that
         # is_dew_phase on each period reflects exactly what the planner enforces.
         dew_enabled_cfg = bool(config.get("dew_avoidance_enabled", False))
@@ -1355,7 +1485,8 @@ class PlannerAgent:
         sessions, log = plan_schedule(config, periods, daily=daily,
                                       seeded_last_mow_date=seed_date,
                                       cycle_data=cycle_data,
-                                      already_mowed_today_sec=already_mowed_today_sec)
+                                      already_mowed_today_sec=already_mowed_today_sec,
+                                      growth=growth_plan)
         self.last_log = log
         save_plan_log(log)
 
